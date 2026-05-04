@@ -1,0 +1,5 @@
+SMTP_PORT=465
+SMTP_USER=dhaque@gmail.com
+SMTP_PASSWORD=Beginning2017
+EMAIL_FROM=dhaque@gmail.com
+EMAIL_TO=dhaque@gmail.com

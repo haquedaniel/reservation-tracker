@@ -1,0 +1,1502 @@
+"""Airbnb reservation tracker.
+
+This script reads the reservation workbook, validates the input sheets,
+builds clean analytical outputs for Excel/Power BI, and optionally sends
+a weekly HTML email.
+
+Run modes:
+    python reservation-tracker.py <workbook_path> update
+    python reservation-tracker.py <workbook_path> weekly-email
+
+Design notes:
+- Excel remains the input layer.
+- Python owns validation and transformation.
+- Power BI / email consume clean output tables.
+"""
+
+from pathlib import Path
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+
+import calendar
+import os
+import smtplib
+import sys
+import argparse
+
+import pandas as pd
+from dotenv import load_dotenv
+
+import gspread
+from google.oauth2.service_account import Credentials
+
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+
+def load_table(source: str, input_path: Path | None, sheet_id: str | None, tab_name: str) -> pd.DataFrame:
+    """
+    Load a named table from either Excel or Google Sheets.
+    """
+
+    if source == "excel":
+        if input_path is None:
+            raise ValueError("input_path is required for Excel source")
+        return pd.read_excel(input_path, sheet_name=tab_name)
+
+    if source == "google-sheets":
+        if sheet_id is None:
+            raise ValueError("sheet_id is required for Google Sheets source")
+        return load_google_sheet_tab(sheet_id, tab_name)
+
+    raise ValueError(f"Unknown source: {source}")
+
+
+
+# =============================================================================
+# General utilities
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Reservation tracker")
+
+    parser.add_argument(
+        "--input",
+        type=str,
+        default="Reservations.xlsm",
+        help="Path to input workbook"
+    )
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output directory (default = iCloud folder)"
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="weekly-email",
+        choices=["update", "weekly-email"],
+        help="Run mode"
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate email but do not send"
+    )
+
+    parser.add_argument(
+    "--source",
+    choices=["excel", "google-sheets"],
+    default="excel",
+    )
+
+    parser.add_argument(
+        "--sheet-id",
+        default=os.environ.get("GOOGLE_SHEET_ID"),
+    )
+
+    return parser.parse_args()
+
+
+
+
+
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly"
+]
+
+
+def get_google_sheets_client():
+    """
+    Create a Google Sheets client using a service account.
+
+    Local:
+    - GOOGLE_SERVICE_ACCOUNT_JSON points to a JSON key file.
+
+    GitHub later:
+    - we can load the JSON from a secret instead.
+    """
+
+    credentials_path = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+
+    credentials = Credentials.from_service_account_file(
+        credentials_path,
+        scopes=GOOGLE_SCOPES,
+    )
+
+    return gspread.authorize(credentials)
+
+
+def load_google_sheet_tab(sheet_id: str, tab_name: str) -> pd.DataFrame:
+    """
+    Load one Google Sheet tab into a pandas DataFrame.
+
+    The first row must contain headers, just like your Excel sheets.
+    """
+
+    client = get_google_sheets_client()
+    spreadsheet = client.open_by_key(sheet_id)
+    worksheet = spreadsheet.worksheet(tab_name)
+
+    rows = worksheet.get_all_records()
+
+    return pd.DataFrame(rows)
+
+
+
+def normalise_listing_key(value) -> str | None:
+    """
+    Convert Excel listing values to a stable string key.
+    Examples:
+    - 2 -> "2"
+    - 2.0 -> "2"
+    - blank -> None
+    """
+    if pd.isna(value):
+        return None
+
+    try:
+        number = float(value)
+        if number.is_integer():
+            return str(int(number))
+    except (ValueError, TypeError):
+        pass
+
+    return str(value).strip()
+
+
+def get_output_dir() -> Path:
+    """
+    Return the iCloud Drive output folder.
+
+    Adjust the last two folder names if you want a different location.
+    """
+    output_dir = (
+        Path.home()
+        / "Library"
+        / "Mobile Documents"
+        / "com~apple~CloudDocs"
+        / "airbnb-tracker"
+        / "output"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def validate_required_columns(df: pd.DataFrame, required_columns: list[str]) -> None:
+    """
+    Check that the expected Excel columns exist before we do any transformations.
+
+    This is a schema check:
+    - are the columns we depend on actually present?
+    """
+    missing = [col for col in required_columns if col not in df.columns]
+
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+
+def drop_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove rows that are completely empty.
+
+    Why:
+    - Excel sheets often contain blank lines
+    - they add noise and can trigger false validation errors
+    """
+    df = df.copy()
+    df = df.dropna(how="all")
+    return df
+
+
+def parse_types(df: pd.DataFrame, date_columns, numeric_columns) -> pd.DataFrame:
+    """
+    Convert dates and numeric columns to the right types.
+
+    Important:
+    - Excel data may come in as text, mixed types, or blanks
+    - errors='coerce' turns invalid values into NaN / NaT instead of crashing
+    """
+    df = df.copy()
+
+    for col in date_columns:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+
+
+    for col in numeric_columns:
+        if col in df.columns:
+            # Replace comma decimals if Excel/text import gives strings like "218,85"
+            if df[col].dtype == "object":
+                df[col] = df[col].astype(str).str.replace(",", ".", regex=False)
+
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+# =============================================================================
+# Workbook loaders
+# =============================================================================
+
+def load_reservations(source: str, input_path: Path | None, sheet_id: str | None, sheet_name: str = "Reservations") -> pd.DataFrame:
+    return load_table(source, input_path, sheet_id, sheet_name)
+
+
+def load_targets(source: str, input_path: Path | None, sheet_id: str | None, sheet_name: str = "Monthly Targets") -> pd.DataFrame:
+    return load_table(source, input_path, sheet_id, sheet_name)
+
+
+def load_fixed_expenses(source: str, input_path: Path | None, sheet_id: str | None, sheet_name: str = "Fixed Expenses") -> pd.DataFrame:
+    return load_table(source, input_path, sheet_id, sheet_name)
+
+
+def load_variable_expenses(source: str, input_path: Path | None, sheet_id: str | None, sheet_name: str = "Variable Expenses") -> pd.DataFrame:
+    return load_table(source, input_path, sheet_id, sheet_name)
+
+
+def load_listings_lookup(source: str, input_path: Path | None, sheet_id: str | None) -> pd.DataFrame:
+    df = load_table(source, input_path, sheet_id, "Listings")
+
+    df.columns = df.columns.str.strip()
+
+    df = df.rename(columns={
+        "Listing": "listing",
+        "Name": "listing_name",
+        "Description AirBnB": "listing_description",
+    })
+
+    validate_required_columns(df, ["listing", "listing_name"])
+
+    df["listing"] = df["listing"].apply(normalise_listing_key)
+
+    return df
+
+
+
+# =============================================================================
+# Listing lookup / enrichment
+# =============================================================================
+
+
+def enrich_with_listing_info(df: pd.DataFrame, listings: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add listing_name and listing_description to a dataframe that already has
+    a standardised 'listing' column.
+    """
+    df = df.copy()
+    listings = listings.copy()
+
+    df["listing"] = df["listing"].apply(normalise_listing_key)
+    listings["listing"] = listings["listing"].apply(normalise_listing_key)
+
+    enriched = df.merge(
+        listings[["listing", "listing_name", "listing_description"]],
+        on="listing",
+        how="left"
+    )
+
+    enriched["listing_name"] = enriched["listing_name"].fillna(enriched["listing"])
+
+    return enriched
+
+
+# =============================================================================
+# Reservations cleaning, validation, and expansion
+# =============================================================================
+
+
+def rename_reservation_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename Excel-style column names to Python-friendly names.
+
+    Why do this?
+    - avoids spaces in column names
+    - makes code easier to read and write
+    """
+    df = df.copy()
+
+    column_map = {
+        "Guest Name": "guest_name",
+        "Listing": "listing",
+        "Booking Source": "booking_source",
+        "Confirmation Code": "confirmation_code",
+        "Check in Date": "checkin_date",
+        "Number of Nights": "nights",
+        "Total Revenue": "total_revenue",
+        "Cleaning Fees": "cleaning_fees",
+        "Concierge Commission": "concierge_commission",
+        "Revenue Net": "revenue_net",
+        "Booking Date": "booking_date",
+        "Reservation Date": "booking_date",
+    }
+
+    df = df.rename(columns=column_map)
+    return df
+
+
+def add_optional_reservation_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure optional reservation columns exist so downstream code does not fail
+    when the Excel workbook does not contain them.
+    """
+    df = df.copy()
+
+    optional_columns = [
+        "guest_name",
+        "booking_source",
+        "confirmation_code",
+        "total_revenue",
+        "cleaning_fees",
+        "concierge_commission",
+        "booking_date",
+    ]
+
+    for col in optional_columns:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    return df
+
+
+def add_checkout_date(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive checkout_date using hotel logic:
+
+    checkout_date = checkin_date + nights
+
+    Example:
+    - checkin: 2026-01-30
+    - nights: 3
+    - checkout: 2026-02-02
+    """
+    df = df.copy()
+
+    df["checkout_date"] = df["checkin_date"] + pd.to_timedelta(df["nights"], unit="D")
+    return df
+
+
+def validate_reservations(df: pd.DataFrame) -> None:
+    """
+    Validate business rules on the reservations table.
+
+    Hard errors:
+    - listing must be present
+    - checkin_date must be valid
+    - nights must be > 0
+    - revenue_net must be numeric
+    - booking_date, if present, must be <= checkin_date
+    """
+    errors = []
+
+    for idx, row in df.iterrows():
+        row_num = idx + 2  # +2 because Excel row numbers usually start after header
+
+        # Listing must exist
+        if pd.isna(row["listing"]):
+            errors.append(f"Row {row_num}: missing listing")
+
+        # Check-in date must exist and be valid
+        if pd.isna(row["checkin_date"]):
+            errors.append(f"Row {row_num}: invalid or missing checkin_date")
+
+        # Nights must exist and be > 0
+        if pd.isna(row["nights"]):
+            errors.append(f"Row {row_num}: invalid or missing nights")
+        elif row["nights"] <= 0:
+            errors.append(f"Row {row_num}: nights must be > 0")
+
+        # Revenue net must exist and be numeric
+        if pd.isna(row["revenue_net"]):
+            errors.append(f"Row {row_num}: invalid or missing revenue_net")
+
+        # Booking date can be empty, but if present it must be <= check-in date
+        if not pd.isna(row["booking_date"]) and not pd.isna(row["checkin_date"]):
+            if row["booking_date"] > row["checkin_date"]:
+                errors.append(
+                    f"Row {row_num}: booking_date is after checkin_date"
+                )
+
+    if errors:
+        error_text = "\n".join(errors)
+        raise ValueError(f"Reservation validation failed:\n{error_text}")
+
+
+def find_overlaps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect overlapping bookings for the same listing.
+
+    Logic:
+    - group by listing
+    - sort by checkin_date
+    - compare each booking to the previous one
+    - overlap exists if current checkin < previous checkout
+    """
+    overlap_rows = []
+
+    for listing, group in df.groupby("listing"):
+        group = group.sort_values("checkin_date")
+
+        previous_row = None
+
+        for _, row in group.iterrows():
+            if previous_row is None:
+                previous_row = row
+                continue
+
+            if row["checkin_date"] < previous_row["checkout_date"]:
+                overlap_rows.append(
+                    {
+                        "listing": listing,
+                        "previous_guest": previous_row.get("guest_name"),
+                        "previous_checkin": previous_row["checkin_date"],
+                        "previous_checkout": previous_row["checkout_date"],
+                        "current_guest": row.get("guest_name"),
+                        "current_checkin": row["checkin_date"],
+                        "current_checkout": row["checkout_date"],
+                    }
+                )
+
+            previous_row = row
+
+    return pd.DataFrame(overlap_rows)
+
+
+def expand_booking_nights(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expand each booking into one row per occupied night.
+
+    Output:
+    - one row per listing per night
+    """
+
+    rows = []  # we collect rows here, then build a DataFrame at the end
+
+    for _, row in df.iterrows():
+
+        start_date = row["checkin_date"]
+        end_date = row["checkout_date"]
+
+        # Compute daily values once per booking
+        daily_revenue_net = row["revenue_net"] / row["nights"]
+ 
+        if not pd.isna(row.get("concierge_commission")):
+            daily_concierge_commission = row["concierge_commission"] / row["nights"]
+        else:
+            daily_concierge_commission = 0
+
+        if not pd.isna(row.get("cleaning_fees")):
+            daily_cleaning_fees = row["cleaning_fees"] / row["nights"]
+        else:
+            daily_cleaning_fees = 0 
+        
+        if not pd.isna(row.get("total_revenue")):
+            daily_revenue_total = row["total_revenue"] / row["nights"]
+        else:
+            daily_revenue_total = pd.NA
+
+        # Create date range 
+        dates = pd.date_range(start=start_date, end=end_date, inclusive="left")
+
+        for date in dates:
+            rows.append({
+                "date": date,
+                "year": date.year,
+                "month": date.month,
+                "listing": normalise_listing_key(row["listing"]),
+                "guest_name": row.get("guest_name"),
+                "booking_source": row.get("booking_source"),
+                "confirmation_code": row.get("confirmation_code"),
+                "booking_date": row.get("booking_date"),
+                "checkin_date": start_date,
+                "checkout_date": end_date,
+                "nights": row["nights"],
+                "occupied": 1,
+                "daily_concierge_commission": daily_concierge_commission,
+                "daily_cleaning_fees": daily_cleaning_fees,
+                "daily_revenue_net": daily_revenue_net,
+                "daily_revenue_total": daily_revenue_total,
+            })
+
+    # Convert list of dicts into DataFrame
+    expanded_df = pd.DataFrame(rows)
+    if not expanded_df.empty:
+        expanded_df["listing"] = expanded_df["listing"].apply(normalise_listing_key)
+    return expanded_df
+
+
+# =============================================================================
+# Calendar, occupancy, and targets
+# =============================================================================
+
+
+def build_calendar(year, df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    df = df.copy()
+    start_date = datetime(int(year), 1, 1)
+    end_date = datetime(int(year), 12, 31)
+    dates = pd.date_range(start=start_date, end=end_date)
+
+    for listing in df["listing"].dropna().apply(normalise_listing_key).unique():
+
+        for date in dates:
+            rows.append({
+                "date": date,
+                "year": date.year,
+                "month": date.month,
+                "listing": listing,
+            })
+
+    calendar = pd.DataFrame(rows)
+    calendar = calendar.sort_values("listing")
+    calendar["listing"] = calendar["listing"].apply(normalise_listing_key)
+    return calendar
+
+
+def build_daily_occupancy(calendar: pd.DataFrame, booking_nights: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge full calendar with booking nights to create a complete daily occupancy table.
+
+    Output:
+    - one row per date + listing
+    - includes both occupied and unoccupied nights
+    """
+    calendar = calendar.copy()
+    booking_nights = booking_nights.copy()
+    calendar["listing"] = calendar["listing"].apply(normalise_listing_key)
+    booking_nights["listing"] = booking_nights["listing"].apply(normalise_listing_key)
+    daily = calendar.merge(
+        booking_nights,
+        on=["date", "month", "year", "listing"],
+        how="left"
+    )
+
+    # Fill missing values (i.e. unoccupied nights)
+    daily["occupied"] = daily["occupied"].fillna(0).astype(int)
+    daily["daily_revenue_net"] = daily["daily_revenue_net"].fillna(0)
+    daily["daily_revenue_total"] = daily["daily_revenue_total"].fillna(0)
+    daily["daily_cleaning_fees"] = daily["daily_cleaning_fees"].fillna(0)
+    daily["daily_concierge_commission"] = daily["daily_concierge_commission"].fillna(0)
+
+    return daily
+
+
+def rename_target_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename Excel-style column names to Python-friendly names.
+
+    Why do this?
+    - avoids spaces in column names
+    - makes code easier to read and write
+    """
+    df = df.copy()
+
+    column_map = {
+        "Month": "month",
+        "Year": "year",
+    }
+
+    df = df.rename(columns=column_map)
+    return df
+
+
+def expand_targets(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    targets=[]
+    for _,row in df.iterrows():
+
+        for col in df.columns[2:]:
+            listing = str(col)
+            targets.append([int(row["year"]), int(row["month"]), listing, row[col]])
+
+    df = pd.DataFrame(targets)
+    return df
+    """
+    df = df.dropna(subset=["year", "month"])
+    melted = df.melt(id_vars=["year", "month"], var_name="listing", value_name="target")
+    melted["listing"] = melted["listing"].apply(normalise_listing_key)
+    return melted
+
+
+def build_daily_targets(df_calendar: pd.DataFrame, monthly_targets: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge full calendar with targets to create a complete daily targets table.
+
+    Output:
+    - one row per date + listing
+    """
+    df_calendar = df_calendar.copy()
+    monthly_targets = monthly_targets.copy()
+    df_calendar["listing"] = df_calendar["listing"].apply(normalise_listing_key)
+    monthly_targets["listing"] = monthly_targets["listing"].apply(normalise_listing_key)
+
+    monthly_targets["days_in_month"] = monthly_targets.apply(
+        lambda row: calendar.monthrange(int(row["year"]), int(row["month"]))[1],
+        axis=1
+    )
+
+    monthly_targets["daily_target"]=monthly_targets["target"] / monthly_targets["days_in_month"]
+
+    daily_targets = df_calendar.merge(
+        monthly_targets,
+        on=["year", "month", "listing"],
+        how="left"
+    )
+
+    return daily_targets
+
+
+# =============================================================================
+# Expense processing
+# =============================================================================
+
+
+def _month_columns(df: pd.DataFrame) -> list:
+    """Return columns that look like YYYY-MM month columns."""
+    return [col for col in df.columns if str(col).startswith("2026-")]
+
+
+def expand_fixed_expenses(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert the Fixed Expenses sheet from wide monthly format to long monthly format.
+
+    Fixed expenses are real monthly costs. They are summed directly for monthly/YTD
+    cost reporting.
+    """
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+
+    id_vars = ["Description", "Listing"]
+    month_cols = _month_columns(df)
+
+    df_long = df.melt(
+        id_vars=id_vars,
+        value_vars=month_cols,
+        var_name="year_month",
+        value_name="monthly_expense"
+    )
+
+    df_long["monthly_expense"] = pd.to_numeric(df_long["monthly_expense"], errors="coerce").fillna(0)
+    df_long["year"] = df_long["year_month"].astype(str).str[:4].astype(int)
+    df_long["month"] = df_long["year_month"].astype(str).str[5:7].astype(int)
+    df_long["listing"] = df_long["Listing"].apply(normalise_listing_key)
+    df_long["description"] = df_long["Description"]
+    df_long["expense_type"] = "fixed"
+    df_long["version"] = "actual"
+    df_long["selected_version"] = "actual"
+    df_long["allocated_monthly_expense"] = df_long["monthly_expense"]
+
+    df_long["days_in_month"] = df_long.apply(
+        lambda row: calendar.monthrange(int(row["year"]), int(row["month"]))[1],
+        axis=1
+    )
+    df_long["daily_expense"] = df_long["allocated_monthly_expense"] / df_long["days_in_month"]
+
+    return df_long
+
+
+def expand_variable_expenses(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert the Variable Expenses sheet from wide monthly format to long monthly format.
+
+    The sheet contains estimate and actual rows. For each listing + description + month:
+    - use actual when present
+    - otherwise use estimate
+
+    The resulting monthly_expense is the selected monthly variable cost used for
+    reporting and allocation to bookings.
+    """
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+
+    id_vars = ["Description", "Listing", "Type"]
+    month_cols = _month_columns(df)
+
+    df_long = df.melt(
+        id_vars=id_vars,
+        value_vars=month_cols,
+        var_name="year_month",
+        value_name="monthly_expense"
+    )
+
+    df_long["monthly_expense"] = pd.to_numeric(df_long["monthly_expense"], errors="coerce")
+    df_long["year"] = df_long["year_month"].astype(str).str[:4].astype(int)
+    df_long["month"] = df_long["year_month"].astype(str).str[5:7].astype(int)
+    df_long["listing"] = df_long["Listing"].apply(normalise_listing_key)
+    df_long["description"] = df_long["Description"]
+    df_long["version"] = (
+        df_long["Type"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    df_long["expense_type"] = "variable"
+
+    # Future actual cells should be blank, not zero. Blank means "no actual yet".
+    estimates = df_long[df_long["version"] == "estimate"].copy()
+    actuals = df_long[(df_long["version"] == "actual") & (df_long["monthly_expense"].notna())].copy()
+
+    estimates["version_priority"] = 0
+    actuals["version_priority"] = 1
+
+    selected = pd.concat([estimates, actuals], ignore_index=True)
+    selected = selected.sort_values("version_priority")
+    selected = selected.drop_duplicates(
+        subset=["listing", "description", "year", "month"],
+        keep="last"
+    )
+
+    selected["selected_version"] = selected["version"]
+    selected["monthly_expense"] = selected["monthly_expense"].fillna(0)
+    selected["allocated_monthly_expense"] = selected["monthly_expense"]
+
+    selected["days_in_month"] = selected.apply(
+        lambda row: calendar.monthrange(int(row["year"]), int(row["month"]))[1],
+        axis=1
+    )
+
+    # This daily value is used when allocating variable costs to occupied reservation nights.
+    selected["daily_expense"] = selected["allocated_monthly_expense"] / selected["days_in_month"]
+
+    return selected.drop(columns=["version_priority"], errors="ignore")
+
+
+def combine_monthly_expenses(
+    fixed_expenses: pd.DataFrame,
+    variable_expenses: pd.DataFrame
+) -> pd.DataFrame:
+    """Combine selected fixed and variable monthly expenses for reporting."""
+    return pd.concat([fixed_expenses, variable_expenses], ignore_index=True)
+
+
+def expand_daily_expenses(df_long: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for _, row in df_long.iterrows():
+        start_date = datetime(int(row["year"]), int(row["month"]), 1)
+        end_date = datetime(
+            int(row["year"]),
+            int(row["month"]),
+            calendar.monthrange(int(row["year"]), int(row["month"]))[1]
+        )
+
+        dates = pd.date_range(start=start_date, end=end_date)
+
+        for date in dates:
+            rows.append({
+                "date": date,
+                "year": date.year,
+                "month": date.month,
+                "listing": normalise_listing_key(row["listing"]),
+                "description": row.get("description"),
+                "expense_type": row.get("expense_type"),
+                "daily_expense": row["daily_expense"],
+            })
+
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# Weekly reporting calculations
+# =============================================================================
+
+
+def get_week_bounds(today: datetime | None = None) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    Return Monday-Sunday bounds for the current week.
+
+    Later we can change this to 'next week' if useful for operations.
+    """
+    if today is None:
+        today = datetime.today()
+
+    start = today - timedelta(days=today.weekday())  # Monday
+    end = start + timedelta(days=6)                  # Sunday
+
+    return pd.Timestamp(start.date()), pd.Timestamp(end.date())
+
+
+def build_weekly_arrivals_departures_summary(
+    reservations: pd.DataFrame,
+    today: datetime | None = None
+) -> dict:
+    """
+    Build arrivals/departures summary from the reservations table.
+
+    Expected columns:
+    - guest_name
+    - listing
+    - checkin_date
+    - checkout_date
+    - nights
+    """
+
+    df = reservations.copy()
+
+    start_of_week, end_of_week = get_week_bounds(today)
+
+    arrivals = df[
+        (df["checkin_date"] >= start_of_week) &
+        (df["checkin_date"] <= end_of_week)
+    ].sort_values(["checkin_date", "listing"])
+
+    departures = df[
+        (df["checkout_date"] >= start_of_week) &
+        (df["checkout_date"] <= end_of_week)
+    ].sort_values(["checkout_date", "listing"])
+
+    return {
+        "start_of_week": start_of_week,
+        "end_of_week": end_of_week,
+        "arrivals": arrivals,
+        "departures": departures,
+        "num_arrivals": len(arrivals),
+        "num_departures": len(departures),
+    }
+
+
+def build_weekly_occupancy(
+    daily: pd.DataFrame,
+    today: datetime | None = None,
+    weeks_ahead: int = 8
+) -> pd.DataFrame:
+    """
+    Build weekly occupancy by listing for the next N weeks.
+
+    Uses daily occupancy table:
+    - one row per date + listing
+    - occupied = 0/1
+    """
+
+    if today is None:
+        today = datetime.today()
+
+    start_date = pd.Timestamp(today.date())
+
+    # roughly next 2 months = 8 weeks
+    end_date = start_date + pd.Timedelta(weeks=weeks_ahead)
+
+    df = daily.copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Keep only future dates in the selected horizon
+    df = df[
+        (df["date"] >= start_date) &
+        (df["date"] < end_date)
+    ]
+
+    # Week starts on Monday
+    df["week_start"] = df["date"] - pd.to_timedelta(df["date"].dt.weekday, unit="D")
+    df["week_end"] = df["week_start"] + pd.Timedelta(days=6)
+
+    weekly = (
+        df.groupby(
+            ["week_start", "week_end", "listing"],
+            as_index=False
+        )
+        .agg(
+            occupied_nights=("occupied", "sum"),
+            available_nights=("date", "count"),
+        )
+    )
+
+    weekly["occupancy_rate"] = (
+        weekly["occupied_nights"] / weekly["available_nights"]
+    )
+
+    return weekly
+
+
+def pivot_weekly_occupancy(weekly: pd.DataFrame) -> pd.DataFrame:
+
+    df = weekly.copy()
+
+    # Create sortable key
+    df["week_start"] = pd.to_datetime(df["week_start"])
+
+    # Create display label
+    df["week_label"] = df["week_start"].dt.strftime("%d %b")
+
+    # Sort BEFORE pivot
+    df = df.sort_values("week_start")
+
+    pivot = df.pivot_table(
+        index=["listing_name"],
+        columns="week_label",
+        values="occupancy_rate",
+        aggfunc="first"
+    )
+
+    # Reorder columns properly
+    ordered_cols = (
+        df[["week_start", "week_label"]]
+        .drop_duplicates()
+        .sort_values("week_start")["week_label"]
+        .tolist()
+    )
+
+    pivot = pivot[ordered_cols]
+
+    pivot = pivot.reset_index()
+
+    # Format as %
+    for col in ordered_cols:
+        pivot[col] = (pivot[col] * 100).round(0).astype("Int64").astype(str) + "%"
+
+    return pivot
+
+
+def build_revenue_this_week(
+    reservations: pd.DataFrame,
+    daily_expenses: pd.DataFrame,
+    today: datetime | None = None
+) -> pd.DataFrame:
+
+    df = reservations.copy()
+    expenses = daily_expenses.copy()
+
+    start_of_week, end_of_week = get_week_bounds(today)
+
+    week = df[
+        (df["checkin_date"] >= start_of_week) &
+        (df["checkin_date"] <= end_of_week)
+    ].copy()
+
+    rows = []
+
+    for _, row in week.iterrows():
+        # Allocate only variable expenses to an individual reservation.
+        # Fixed monthly costs such as mortgage or insurance are kept for
+        # monthly/YTD profitability, not booking contribution.
+        stay_expenses = expenses[
+            (expenses["listing"].astype(str) == str(row["listing"])) &
+            (expenses["date"] >= row["checkin_date"]) &
+            (expenses["date"] < row["checkout_date"]) &
+            (expenses["expense_type"] == "variable")
+        ]
+
+        estimated_variable_expenses = stay_expenses["daily_expense"].sum()
+
+        gross_revenue = 0 if pd.isna(row.get("total_revenue")) else row.get("total_revenue")
+        cleaning_fees = 0 if pd.isna(row.get("cleaning_fees")) else row.get("cleaning_fees")
+        concierge_fees = 0 if pd.isna(row.get("concierge_commission")) else row.get("concierge_commission")
+
+        revenue_net_before_tax = (
+            gross_revenue
+            - cleaning_fees
+            - concierge_fees
+            - estimated_variable_expenses
+        )
+
+         
+        rows.append({
+           # "checkin_date": row["checkin_date"],
+            "Guest_Name": row.get("guest_name"),
+           # "listing": row["listing"],
+            "Listing_Name": row.get("listing_name"),
+            "Nights": row["nights"],
+            "Gross_Revenue": gross_revenue,
+            "Cleaning_Fees": cleaning_fees,
+            "Concierge_Fees": concierge_fees,
+            "Variable_Expenses": estimated_variable_expenses,
+            "Net_Before_Fixed_Costs": revenue_net_before_tax,
+        })
+
+    cols_to_round = [
+        "Gross_Revenue",
+        "Cleaning_Fees",
+        "Concierge_Fees",
+        "Variable_Expenses",
+        "Net_Before_Fixed_Costs",
+    ]
+
+    result = pd.DataFrame(rows)
+    result[cols_to_round] = result[cols_to_round].round(0).astype("Int64")
+
+    total_row = {
+    "Guest_Name": "TOTAL",
+    "Listing_Name": "",
+    "Nights": result["Nights"].sum(),
+}
+
+    for col in cols_to_round:
+        total_row[col] = result[col].sum()
+
+    result = pd.concat(
+        [result, pd.DataFrame([total_row])],
+        ignore_index=True
+    )
+
+    result["_sort"] = result["Listing_Name"].replace("", "ZZZ_TOTAL")
+    result = result.sort_values("_sort").drop(columns="_sort")
+    return result
+
+
+# =============================================================================
+# Email rendering and sending
+# =============================================================================
+
+
+def dataframe_to_html_table(
+    df: pd.DataFrame,
+    columns: list[str] | None = None,
+    currency_columns: list[str] | None = None,
+) -> str:
+
+    if df.empty:
+        return "<p><em>No data available</em></p>"
+
+    if columns is not None:
+        df = df[columns]
+
+    currency_columns = currency_columns or []
+
+    table_style = "border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 13px;"
+    th_style = "border: 1px solid #ddd; padding: 8px; background-color: #f3f4f6; text-align: left;"
+    td_style = "border: 1px solid #ddd; padding: 8px;"
+
+    html = f'<table style="{table_style}"><thead><tr>'
+
+    for col in df.columns:
+        label = col.replace("_", " ")
+        html += f'<th style="{th_style}">{label}</th>'
+
+    html += "</tr></thead><tbody>"
+
+    for _, row in df.iterrows():
+        is_total = str(row.iloc[0]).upper() == "TOTAL"
+        row_style = "font-weight:bold; background-color:#f9fafb;" if is_total else ""
+
+        html += f'<tr style="{row_style}">'
+
+        for col in df.columns:
+            value = row[col]
+            cell_style = td_style
+
+            if isinstance(value, pd.Timestamp):
+                value = value.strftime("%a %d %b")
+
+            if isinstance(value, str) and value.strip().endswith("%"):
+                pct = int(value.strip().replace("%", ""))
+
+                if pct == 0:
+                    cell_style += " color:#dc2626; font-weight:bold;"
+                elif pct < 30:
+                    cell_style += " color:#f59e0b;"
+                elif pct > 70:
+                    cell_style += " color:#16a34a;"
+
+            if col in currency_columns and pd.notna(value):
+                value = f"{float(value):,.0f} €"
+
+            align = "right" if col in currency_columns or col == "Nights" else "left"
+
+            # IMPORTANT: this line must be inside the for col loop
+            html += f'<td style="{cell_style} text-align:{align};">{value}</td>'
+
+        html += "</tr>"
+
+    html += "</tbody></table>"
+
+    return html
+
+
+def build_weekly_email_html(summary: dict, weekly_occupancy_pivot: pd.DataFrame, revenue_this_week: pd.DataFrame) -> str:
+    start = summary["start_of_week"].strftime("%d %b")
+    end = summary["end_of_week"].strftime("%d %b %Y")
+
+
+    total_gross = revenue_this_week.loc[
+        revenue_this_week["Guest_Name"] == "TOTAL",
+        "Gross_Revenue"
+    ].sum()
+
+    total_net = revenue_this_week.loc[
+        revenue_this_week["Guest_Name"] == "TOTAL",
+        "Net_Before_Fixed_Costs"
+    ].sum()
+
+    arrivals_table = dataframe_to_html_table(
+        summary["arrivals"],
+        ["checkin_date", "guest_name", "listing_name", "nights", "booking_source"]
+    )
+
+    departures_table = dataframe_to_html_table(
+        summary["departures"],
+        ["checkout_date", "guest_name", "listing_name", "nights", "booking_source"]
+    )
+
+    occupancy_table = dataframe_to_html_table(weekly_occupancy_pivot)
+
+    revenue_table = dataframe_to_html_table(
+        revenue_this_week,
+        currency_columns=[
+            "Gross_Revenue",
+            "Cleaning_Fees",
+            "Concierge_Fees",
+            "Other_Expenses",
+            "Variable_Expenses",
+            "Net_Before_Fixed_Costs",
+        ],
+    )
+    table_style = f"""(
+        "border-collapse: collapse; "
+        "width: 100%; "
+        "min-width: 760px; "
+        "margin-top: 16px; "
+        "font-family: Arial, sans-serif; "
+        "font-size: 13px;"
+        "border-spacing:12px;"
+    )
+    """
+    #<table style="width:100%; margin-top:16px; border-spacing:12px;">
+
+    kpi_cards = f"""
+        <table role="presentation" style="width:100%; margin-top:16px; border-collapse:separate; border-spacing:8px;">
+        <tr>
+            <td style="width:25%; background:white; padding:14px; border-radius:8px;">
+            <div style="font-size:12px; color:#666;">Arrivals</div>
+            <div style="font-size:24px; font-weight:bold;">{summary["num_arrivals"]}</div>
+            </td>
+
+            <td style="width:25%; background:white; padding:14px; border-radius:8px;">
+            <div style="font-size:12px; color:#666;">Departures</div>
+            <div style="font-size:24px; font-weight:bold;">{summary["num_departures"]}</div>
+            </td>
+
+            <td style="width:25%; background:white; padding:14px; border-radius:8px;">
+            <div style="font-size:12px; color:#666;">Gross revenue</div>
+            <div style="font-size:24px; font-weight:bold;">{total_gross:,.0f} €</div>
+            </td>
+
+            <td style="width:25%; background:white; padding:14px; border-radius:8px;">
+            <div style="font-size:12px; color:#666;">Net before tax</div>
+            <div style="font-size:24px; font-weight:bold;">{total_net:,.0f} €</div>
+            </td>
+        </tr>
+        </table>
+        """
+
+    html = f"""
+    <html>
+    <body style="margin:0; padding:0; background:#f6f7f9; font-family:Arial, sans-serif; color:#222;">
+
+    <div style="max-width:900px; margin:0 auto; padding:24px;">
+
+        <div style="background:#1f2937; color:white; padding:20px; border-radius:8px;">
+        <h2 style="margin:0;">Weekly Reservations Summary</h2>
+        <p style="margin:6px 0 0 0;">{start} – {end}</p>
+        </div>
+
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Overview</h3>
+        <p>
+            <strong>Arrivals:</strong> {summary["num_arrivals"]}<br>
+            <strong>Departures:</strong> {summary["num_departures"]}
+        </p>
+        </div>
+        {kpi_cards}
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Arrivals</h3>
+        {arrivals_table}
+        </div>
+
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Departures</h3>
+        {departures_table}
+        </div>
+
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Revenue this week</h3>
+        <div style="overflow-x:auto; width:100%;">
+            {revenue_table}
+        </div>
+        </div>
+
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Occupancy outlook — next 8 weeks</h3>
+        {occupancy_table}
+        </div>
+
+        <p style="font-size:12px; color:#777; margin-top:20px;">
+        Generated automatically from the reservations workbook.
+        </p>
+
+    </div>
+    </body>
+    </html>
+    """
+
+    return html
+
+
+def send_html_email(subject: str, html_body: str) -> None:
+    """
+    Send an HTML email using SMTP credentials from environment variables.
+
+    This is portable:
+    - local Mac: environment variables / .env
+    - GitHub Actions: repository secrets
+    """
+    print("Looking for .env at:", BASE_DIR / ".env")
+
+    print(BASE_DIR / ".env", (BASE_DIR / ".env").exists())
+
+    print("Exists:", (BASE_DIR / ".env").exists())
+    print("SMTP_HOST:", os.environ.get("SMTP_HOST"))
+    smtp_host = os.environ["SMTP_HOST"]
+    smtp_port = int(os.environ.get("SMTP_PORT", "465"))
+    smtp_user = os.environ["SMTP_USER"]
+    smtp_password = os.environ["SMTP_PASSWORD"]
+
+    email_from = os.environ.get("EMAIL_FROM", smtp_user)
+    email_to = os.environ["EMAIL_TO"]
+
+    recipients = [email.strip() for email in email_to.split(",")]
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = email_from
+    msg["To"] = ", ".join(recipients)
+
+    msg.set_content("This email requires an HTML-compatible email client.")
+    msg.add_alternative(html_body, subtype="html")
+
+    with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+        server.login(smtp_user, smtp_password)
+        server.send_message(msg)
+
+
+# =============================================================================
+# Main orchestration
+# =============================================================================
+
+
+def main() -> None:
+    # --- ARGUMENT PARSING ---
+    args = parse_args()
+    source = args.source
+    sheet_id = args.sheet_id
+    input_path = Path(args.input) if args.input else None
+
+    if args.output:
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        output_dir = get_output_dir()
+
+    mode = args.mode
+    dry_run = args.dry_run
+
+    print(f"Mode: {mode}")
+    print(f"Dry run: {dry_run}")
+    print(f"Source: {source}")
+    print(f"Output: {output_dir}")
+
+    if source == "excel":
+        if input_path is None:
+            raise ValueError("Excel source requires --input")
+
+        if not input_path.exists():
+            raise FileNotFoundError(f"Workbook not found: {input_path}")
+
+        print(f"Reading workbook: {input_path}")
+
+    elif source == "google-sheets":
+        if not sheet_id:
+            raise ValueError("Google Sheets source requires --sheet-id or GOOGLE_SHEET_ID")
+
+        print(f"Reading Google Sheet: {sheet_id}")
+        analysis_year = 2026
+
+    # -----------------------------
+    # Reservations
+    # -----------------------------
+    df = load_reservations(source, input_path, sheet_id)
+
+    required_reservation_columns = [
+        "Listing",
+        "Check in Date",
+        "Number of Nights",
+        "Revenue Net",
+    ]
+    validate_required_columns(df, required_reservation_columns)
+
+    df = drop_empty_rows(df)
+    df = rename_reservation_columns(df)
+    df = add_optional_reservation_columns(df)
+
+    reservation_date_columns = ["booking_date", "checkin_date"]
+    reservation_numeric_columns = [
+        "listing",
+        "nights",
+        "total_revenue",
+        "cleaning_fees",
+        "concierge_commission",
+        "revenue_net",
+    ]
+
+    df = parse_types(df, reservation_date_columns, reservation_numeric_columns)
+    df["listing"] = df["listing"].apply(normalise_listing_key)
+    df = add_checkout_date(df)
+
+    df_listings = load_listings_lookup(source, input_path, sheet_id)
+    df = enrich_with_listing_info(df, df_listings)
+
+    validate_reservations(df)
+
+    overlaps = find_overlaps(df)
+    if not overlaps.empty:
+        overlaps_path = output_dir / "overlaps.csv"
+        overlaps.to_csv(overlaps_path, index=False)
+        print("\nOverlapping bookings found:")
+        print(overlaps)
+        print(f"\nSaved overlap details to: {overlaps_path}")
+        raise ValueError("Overlap validation failed")
+
+    df_reservations = df.copy()
+
+    # -----------------------------
+    # Calendar + daily occupancy
+    # Use the Listings table, not reservations, so listings with no bookings
+    # still exist in the calendar and Power BI model.
+    # -----------------------------
+    calendar = build_calendar(analysis_year, df_listings)
+    booking_nights = expand_booking_nights(df)
+    daily = build_daily_occupancy(calendar, booking_nights)
+
+    # -----------------------------
+    # Monthly targets
+    # -----------------------------
+    required_target_columns = ["Month", "Year"]
+
+    df_targets = load_targets(source, input_path, sheet_id)
+    df_targets = df_targets.dropna(how="all")
+    df_targets = df_targets[
+        ~df_targets["Month"].astype(str).str.strip().str.lower().eq("sum")
+    ]
+
+    validate_required_columns(df_targets, required_target_columns)
+
+    df_targets = rename_target_columns(df_targets)
+
+    # Ensure listing columns become strings
+    df_targets.columns = [
+        str(col) if i >= 2 else col
+        for i, col in enumerate(df_targets.columns)
+    ]
+
+    target_date_columns = []
+    target_numeric_columns = ["year", "month"]
+    target_numeric_columns.extend(df_targets.columns[2:].tolist())
+
+    df_targets = parse_types(df_targets, target_date_columns, target_numeric_columns)
+
+    expanded_targets = expand_targets(df_targets)
+    daily_targets = build_daily_targets(calendar, expanded_targets)
+
+    # -----------------------------
+    # Final joined revenue / target table
+    # -----------------------------
+    final = daily.merge(
+        daily_targets[["date", "year", "month", "listing", "daily_target"]],
+        on=["date", "year", "month", "listing"],
+        how="left",
+    )
+
+    final["daily_target"] = final["daily_target"].fillna(0)
+    final["gap"] = final["daily_revenue_net"] - final["daily_target"]
+
+    # -----------------------------
+    # Expenses
+    # -----------------------------
+    df_fixed_expenses = load_fixed_expenses(source, input_path, sheet_id)
+    df_variable_expenses = load_variable_expenses(source, input_path, sheet_id)
+
+    df_fixed_expenses_long = expand_fixed_expenses(df_fixed_expenses)
+    df_variable_expenses_long = expand_variable_expenses(df_variable_expenses)
+
+    df_expanded_expenses = combine_monthly_expenses(
+        df_fixed_expenses_long,
+        df_variable_expenses_long
+    )
+    df_expanded_daily_expenses = expand_daily_expenses(df_expanded_expenses)
+
+    # -----------------------------
+    # Save outputs
+    # -----------------------------
+    df.to_csv(output_dir / "reservations_clean.csv", index=False)
+    df_listings.to_csv(output_dir / "listings.csv", index=False)
+
+    calendar.to_csv(output_dir / "calendar.csv", index=False)
+    booking_nights.to_csv(output_dir / "booking_nights.csv", index=False)
+    daily.to_csv(output_dir / "daily_occupancy.csv", index=False)
+
+    df_targets.to_csv(output_dir / "targets_wide_clean.csv", index=False)
+    expanded_targets.to_csv(output_dir / "targets_long.csv", index=False)
+    daily_targets.to_csv(output_dir / "daily_targets.csv", index=False)
+
+    df_fixed_expenses_long.to_csv(output_dir / "fixed_expenses_monthly_long.csv", index=False)
+    df_variable_expenses_long.to_csv(output_dir / "variable_expenses_monthly_long.csv", index=False)
+    df_expanded_expenses.to_csv(output_dir / "expenses_monthly_long.csv", index=False)
+    df_expanded_daily_expenses.to_csv(output_dir / "expenses_long.csv", index=False)
+
+    final.to_csv(output_dir / "daily_performance.csv", index=False)
+
+    print("Reservations loaded and validated successfully.")
+    print(f"Outputs saved to: {output_dir}")
+
+
+    weekly_occupancy = build_weekly_occupancy(daily)
+
+    weekly_occupancy = weekly_occupancy.merge(
+        df_listings[["listing", "listing_name"]],
+        on="listing",
+        how="left"
+        )
+    
+    weekly_occupancy["listing"] = weekly_occupancy["listing"].astype(str)
+    df_listings["listing"] = df_listings["listing"].astype(str)
+
+   # weekly = weekly.rename(columns={"Name": "listing_name"})
+    weekly_occupancy_pivot = pivot_weekly_occupancy(weekly_occupancy)
+
+    weekly_occupancy.to_csv(output_dir / "weekly_occupancy_long.csv", index=False)
+    weekly_occupancy_pivot.to_csv(output_dir / "weekly_occupancy_pivot.csv", index=False)
+
+    revenue_this_week = build_revenue_this_week(
+        df_reservations,
+        df_expanded_daily_expenses
+    )
+
+
+    # -----------------------------
+    # Optional weekly email
+    # -----------------------------
+    if mode == "weekly-email":
+        summary = build_weekly_arrivals_departures_summary(df_reservations)
+        html = build_weekly_email_html(summary, weekly_occupancy_pivot, revenue_this_week)
+
+        subject = (
+            f"Weekly Reservations Summary "
+            f"{summary['start_of_week'].strftime('%d %b')} – "
+            f"{summary['end_of_week'].strftime('%d %b')}"
+        )
+
+        if dry_run:
+            preview_path = output_dir / "email_preview.html"
+            preview_path.write_text(html, encoding="utf-8")
+            print(f"Dry run: email preview saved to {preview_path}")
+        else:
+            send_html_email(subject, html)
+            print("Weekly email sent.")
+
+
+if __name__ == "__main__":
+    main()
