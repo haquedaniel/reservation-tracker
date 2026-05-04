@@ -114,23 +114,9 @@ GOOGLE_SCOPES = [
 
 
 def get_google_sheets_client():
-    """
-    Create a Google Sheets client using a service account.
-
-    Local:
-    - GOOGLE_SERVICE_ACCOUNT_JSON points to a JSON key file.
-
-    GitHub later:
-    - we can load the JSON from a secret instead.
-    """
-
-
-  import json
-
-credentials_env = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    credentials_env = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
     try:
-        # Try to parse as JSON (GitHub case)
         credentials_dict = json.loads(credentials_env)
 
         credentials = Credentials.from_service_account_info(
@@ -138,16 +124,17 @@ credentials_env = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
             scopes=GOOGLE_SCOPES,
         )
 
-        print("Using service account JSON (env)")
+        print("Using service account JSON from environment")
 
     except json.JSONDecodeError:
-        # Fallback to file path (local case)
+        credentials_path = credentials_env.strip()
+
         credentials = Credentials.from_service_account_file(
-            credentials_env,
+            credentials_path,
             scopes=GOOGLE_SCOPES,
         )
 
-    print("Using service account file")
+        print("Using service account JSON file")
 
     return gspread.authorize(credentials)
 
