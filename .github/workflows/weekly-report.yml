@@ -21,7 +21,7 @@ jobs:
       - name: Create output folder
         run: mkdir -p output
 
-      - name: Run script 
+      - name: Run script dry run
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -29,6 +29,7 @@ jobs:
           python reservation-tracker.py \
             --source google-sheets \
             --mode weekly-email \
+            --dry-run \
             --output output
 
       - name: List output files
