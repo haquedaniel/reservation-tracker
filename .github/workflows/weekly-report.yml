@@ -29,6 +29,7 @@ jobs:
           python reservation-tracker.py \
             --source google-sheets \
             --mode weekly-email \
+            --dry-run \
             --output output
 
       - name: List output files
