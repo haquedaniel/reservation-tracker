@@ -21,7 +21,7 @@ jobs:
       - name: Create output folder
         run: mkdir -p output
 
-      - name: Run script
+       - name: Run script
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -36,7 +36,7 @@ jobs:
             --source google-sheets \
             --mode weekly-email \
             --output output
-            
+
       - name: List output files
         run: ls -lah output/
 
