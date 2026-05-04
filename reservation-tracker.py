@@ -23,6 +23,7 @@ import os
 import smtplib
 import sys
 import argparse
+import json
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -123,12 +124,23 @@ def get_google_sheets_client():
     - we can load the JSON from a secret instead.
     """
 
-    credentials_path = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-    credentials = Credentials.from_service_account_file(
-        credentials_path,
-        scopes=GOOGLE_SCOPES,
-    )
+    credentials_env = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"].strip()
+
+    if credentials_env.startswith("{"):
+        # GitHub mode (JSON content)
+        credentials_dict = json.loads(credentials_env)
+
+        credentials = Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=GOOGLE_SCOPES,
+        )
+    else:
+        # Local mode (file path)
+        credentials = Credentials.from_service_account_file(
+            credentials_env,
+            scopes=GOOGLE_SCOPES,
+        )
 
     return gspread.authorize(credentials)
 
