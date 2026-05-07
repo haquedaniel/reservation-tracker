@@ -1,13 +1,24 @@
-name: Weekly report
+name: Daily reports
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "0 8 * * *"
 
 jobs:
-  run:
+  reports:
     runs-on: ubuntu-latest
+
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_TO: "aurorefourrier@hotmail.fr,${{ secrets.EMAIL_TO }}"
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
       - uses: actions/checkout@v4
@@ -17,30 +28,46 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Create output folder
         run: mkdir -p output
 
-      - name: Run script
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      # -----------------------------
+      # Operational email (unchanged)
+      # -----------------------------
+      - name: Send operational email
         run: |
           python reservation-tracker.py \
             --source google-sheets \
             --mode weekly-email \
+            --groups Voilerie \
             --output output
 
-      - name: List output files
-        run: ls -lah output/
+      # -----------------------------
+      # Finance email - Peskerezh
+      # -----------------------------
+      - name: Send finance email (Peskerezh)
+        run: |
+          python reservation-tracker.py \
+            --source google-sheets \
+            --mode finance-email \
+            --groups Peskerezh \
+            --ai-insights \
+            --output output
+
+      # -----------------------------
+      # Finance email - Voilerie
+      # -----------------------------
+      - name: Send finance email (Voilerie)
+        run: |
+          python reservation-tracker.py \
+            --source google-sheets \
+            --mode finance-email \
+            --groups Voilerie \
+            --ai-insights \
+            --output output
 
       - name: Upload output files
         if: always()
