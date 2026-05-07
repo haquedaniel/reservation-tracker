@@ -3,3 +3,5 @@ openpyxl
 python-dotenv
 gspread
 google-auth
+matplotlib
+openai

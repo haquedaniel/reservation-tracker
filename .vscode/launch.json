@@ -1,41 +1,101 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
             "name": "Weekly email (dry run)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal",
-            "args": [
-            "--mode", "weekly-email",
-            "--dry-run",
-            "--source", "google-sheets"
-            ]
-        },
-
-        {
-            "name": "Send weekly email",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal",
-            "args": ["--mode", "weekly-email"]
-        },
-
-        {
-            "name": "Custom paths",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${file}",
+            "program": "${workspaceFolder}/reservation-tracker.py",
             "console": "integratedTerminal",
             "args": [
                 "--mode", "weekly-email",
                 "--dry-run",
-                "--input", "Reservations.xlsm",
+                "--source", "google-sheets",
+                "--output", "output"
+            ]
+        },
+                {
+            "name": "Weekly email- Voilerie (dry run)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/reservation-tracker.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--mode", "weekly-email",
+                "--dry-run",
+                "--source", "google-sheets",
+                "--groups", "Voilerie",
+                "--output", "output"
+            ]
+        },
+        {
+            "name": "Send weekly email",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/reservation-tracker.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--mode", "weekly-email",
+                "--source", "google-sheets",
+                "--output", "output"
+            ]
+        },
+        {
+            "name": "Finance email (dry run)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/reservation-tracker.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "args": [
+                "--mode", "finance-email",
+                "--dry-run",
+                "--source", "google-sheets",
+                "--output", "output"
+            ]
+        },   
+        {
+            "name": "Finance email - Peskerezh (dry run)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/reservation-tracker.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "args": [
+                "--mode", "finance-email",
+                "--dry-run",
+                "--source", "google-sheets",
+                "--groups", "Peskerezh",
+                "--output", "output"
+            ]
+        },  
+                {
+            "name": "Finance email - Voilerie (dry run)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/reservation-tracker.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "args": [
+                "--mode", "finance-email",
+                "--dry-run",
+                "--source", "google-sheets",
+                "--groups", "Voilerie",
+                "--ai-insights",
+                "--output", "output"
+            ]
+        },  
+        {
+            "name": "Excel debug (local file)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/reservation-tracker.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--mode", "weekly-email",
+                "--dry-run",
+                "--source", "excel",
+                "--input", "${workspaceFolder}/Reservations.xlsm",
                 "--output", "output"
             ]
         }

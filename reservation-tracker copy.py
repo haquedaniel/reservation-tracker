@@ -34,11 +34,6 @@ import base64
 import gspread
 from google.oauth2.service_account import Credentials
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -114,12 +109,6 @@ def parse_args():
         type=str,
         default=None,
         help="Comma-separated listing groups to include in finance reports, e.g. Voilerie,Peskerezh",
-    )
-
-    parser.add_argument(
-        "--ai-insights",
-        action="store_true",
-        help="Add optional GenAI insights to the finance email. Requires OPENAI_API_KEY.",
     )
 
     return parser.parse_args()
@@ -1628,200 +1617,42 @@ def build_cleaning_pct_net_pivot(monthly_finance: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_listing_ytd_net_chart(
-    daily_for_report: pd.DataFrame,
-    daily_expenses_for_report: pd.DataFrame,
-    listings: pd.DataFrame,
+    monthly_finance: pd.DataFrame,
     output_dir: Path,
     filename_suffix: str = "all-groups",
-    today: datetime | None = None,
 ) -> Path:
     """
-    Build a line chart with one line per listing showing cumulative net revenue.
-
-    This is not pure YTD:
-    - solid line = actuals up to yesterday
-    - dashed line = future on-the-books values
-    - vertical line = today
+    Build a monthly line chart with one line per listing showing cumulative
+    YTD net revenue after fixed costs.
     """
-    if today is None:
-        today = datetime.today()
+    df = monthly_finance.copy()
 
-    today_ts = pd.Timestamp(today).normalize()
-
-    daily = daily_for_report.copy()
-    expenses = daily_expenses_for_report.copy()
-    listings = listings.copy()
-
-    daily["date"] = pd.to_datetime(daily["date"])
-    expenses["date"] = pd.to_datetime(expenses["date"])
-    daily["listing"] = daily["listing"].apply(normalise_listing_key)
-    expenses["listing"] = expenses["listing"].apply(normalise_listing_key)
-    listings["listing"] = listings["listing"].apply(normalise_listing_key)
-
-    revenue_daily = (
-        daily.groupby(["listing", "date"], as_index=False)
-        .agg(
-            gross_revenue=("daily_revenue_total", "sum"),
-            cleaning_fees=("daily_cleaning_fees", "sum"),
-            concierge_fees=("daily_concierge_commission", "sum"),
-        )
+    monthly = (
+        df.groupby(["listing_name", "year_month"], as_index=False)
+        .agg(net_after_fixed=("Net_After_Fixed_Costs", "sum"))
     )
 
-    if expenses.empty:
-        expenses_daily = pd.DataFrame(columns=["listing", "date", "variable", "fixed"])
-    else:
-        expenses_daily = (
-            expenses.groupby(["listing", "date", "expense_type"], as_index=False)
-            .agg(expense=("daily_expense", "sum"))
-            .pivot_table(
-                index=["listing", "date"],
-                columns="expense_type",
-                values="expense",
-                aggfunc="sum",
-                fill_value=0,
-            )
-            .reset_index()
-        )
-
-    if "variable" not in expenses_daily.columns:
-        expenses_daily["variable"] = 0
-    if "fixed" not in expenses_daily.columns:
-        expenses_daily["fixed"] = 0
-
-    chart_df = revenue_daily.merge(
-        expenses_daily[["listing", "date", "variable", "fixed"]],
-        on=["listing", "date"],
-        how="left",
+    monthly = monthly.sort_values(["listing_name", "year_month"])
+    monthly["ytd_net_after_fixed"] = (
+        monthly.groupby("listing_name")["net_after_fixed"].cumsum()
     )
 
-    chart_df[["variable", "fixed"]] = chart_df[["variable", "fixed"]].fillna(0)
-
-    chart_df["net_after_fixed"] = (
-        chart_df["gross_revenue"]
-        - chart_df["cleaning_fees"]
-        - chart_df["concierge_fees"]
-        - chart_df["variable"]
-        - chart_df["fixed"]
-    )
-
-    chart_df = chart_df.merge(
-        listings[["listing", "listing_name"]],
-        on="listing",
-        how="left",
-    )
-
-    chart_df["listing_name"] = chart_df["listing_name"].fillna(chart_df["listing"])
-    chart_df = chart_df.sort_values(["listing_name", "date"])
-    chart_df["cumulative_net_after_fixed"] = (
-        chart_df.groupby("listing_name")["net_after_fixed"].cumsum()
-    )
-
-    chart_path = output_dir / f"listing_net_revenue_actual_otb_{filename_suffix}.png"
+    chart_path = output_dir / f"listing_ytd_net_revenue_{filename_suffix}.png"
 
     plt.figure(figsize=(10, 5))
 
-    for listing_name, group in chart_df.groupby("listing_name"):
-        actual = group[group["date"] < today_ts]
-        future = group[group["date"] >= today_ts]
+    for listing_name, group in monthly.groupby("listing_name"):
+        plt.plot(
+            group["year_month"],
+            group["ytd_net_after_fixed"],
+            marker="o",
+            label=str(listing_name),
+        )
 
-        if not actual.empty:
-            line = plt.plot(
-                actual["date"],
-                actual["cumulative_net_after_fixed"],
-                label=str(listing_name),
-            )
-            line_color = line[0].get_color()
-        else:
-            line = plt.plot([], [], label=str(listing_name))
-            line_color = line[0].get_color()
-
-        if not future.empty:
-            if not actual.empty:
-                bridge = pd.concat([actual.tail(1), future], ignore_index=True)
-            else:
-                bridge = future
-
-            plt.plot(
-                bridge["date"],
-                bridge["cumulative_net_after_fixed"],
-                linestyle="--",
-                color=line_color,
-            )
-
-    plt.axvline(today_ts, linestyle="--", linewidth=1)
-    plt.title("Net Revenue by Listing — Actual + On the Books")
+    plt.title("YTD Net Revenue by Listing")
     plt.xlabel("")
     plt.ylabel("€")
-    plt.legend(fontsize=8)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    plt.savefig(chart_path, dpi=150)
-    plt.close()
-
-    return chart_path
-
-
-def build_monthly_occupancy_chart(
-    monthly_occupancy: pd.DataFrame,
-    output_dir: Path,
-    filename_suffix: str = "all-groups",
-    today: datetime | None = None,
-) -> Path:
-    """
-    Build a monthly occupancy chart with one line per listing.
-
-    Solid line = completed months before the current month.
-    Dashed line = current/future on-the-books months.
-    Vertical line = today.
-    """
-    if today is None:
-        today = datetime.today()
-
-    today_ts = pd.Timestamp(today).normalize()
-    current_month_start = today_ts.replace(day=1)
-
-    df = monthly_occupancy.copy()
-    df["month_start"] = pd.to_datetime(df["year_month"] + "-01")
-    df = df.sort_values(["listing_name", "month_start"])
-
-    chart_path = output_dir / f"occupancy_by_listing_actual_otb_{filename_suffix}.png"
-
-    plt.figure(figsize=(10, 5))
-
-    for listing_name, group in df.groupby("listing_name"):
-        actual = group[group["month_start"] < current_month_start]
-        future = group[group["month_start"] >= current_month_start]
-
-        if not actual.empty:
-            line = plt.plot(
-                actual["month_start"],
-                actual["Occupancy_Rate"] * 100,
-                label=str(listing_name),
-            )
-            line_color = line[0].get_color()
-        else:
-            line = plt.plot([], [], label=str(listing_name))
-            line_color = line[0].get_color()
-
-        if not future.empty:
-            if not actual.empty:
-                bridge = pd.concat([actual.tail(1), future], ignore_index=True)
-            else:
-                bridge = future
-
-            plt.plot(
-                bridge["month_start"],
-                bridge["Occupancy_Rate"] * 100,
-                linestyle="--",
-                color=line_color,
-            )
-
-    plt.axvline(today_ts, linestyle="--", linewidth=1)
-    plt.title("Occupancy by Listing — Actual + On the Books")
-    plt.xlabel("")
-    plt.ylabel("Occupancy %")
-    plt.ylim(0, 105)
+    plt.xticks(rotation=45, ha="right")
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -1943,18 +1774,13 @@ def build_finance_kpis(
     daily_for_report: pd.DataFrame,
     daily_expenses_for_report: pd.DataFrame,
     today: datetime | None = None,
-) -> list[list[dict]]:
+) -> dict:
     """
-    Headline finance KPI cards for the selected report group.
+    Headline finance KPIs for the selected report group.
 
-    Layout:
-    1. headline outcome: YTD, OTB, full-year landing, occupancy
-    2. revenue and cleaning pressure
-    3. profitability funnel per occupied night
-
-    YTD = dates before today.
-    OTB = dates from today onward, confirmed bookings only.
-    Full Year = YTD + OTB.
+    KPI boxes are split into:
+    - YTD actuals: what has already happened
+    - On the books: confirmed future bookings and scheduled expenses
     """
     daily_ytd, daily_otb, expenses_ytd, expenses_otb = _split_ytd_and_otb(
         daily_for_report,
@@ -1964,12 +1790,6 @@ def build_finance_kpis(
 
     ytd = _calculate_period_metrics(daily_ytd, expenses_ytd)
     otb = _calculate_period_metrics(daily_otb, expenses_otb)
-
-    full_year = {
-        "Gross_Revenue": ytd["Gross_Revenue"] + otb["Gross_Revenue"],
-        "Cleaning_Fees": ytd["Cleaning_Fees"] + otb["Cleaning_Fees"],
-        "Net_After_Fixed_Costs": ytd["Net_After_Fixed_Costs"] + otb["Net_After_Fixed_Costs"],
-    }
 
     variable_cost_warning = (
         pd.notna(ytd["Variable_Cost_Per_Night"])
@@ -1983,89 +1803,53 @@ def build_finance_kpis(
         and ytd["Fixed_Cost_Per_Night"] >= ytd["ADR"] * 0.35
     )
 
-    return [
-        [
-            {
-                "label": "Net Profit YTD",
-                "display": _format_kpi_value(ytd["Net_After_Fixed_Costs"], "currency"),
-                "color": _kpi_color(ytd["Net_After_Fixed_Costs"]),
-                "note": "actuals to yesterday",
-            },
-            {
-                "label": "Net Profit on the Books",
-                "display": _format_kpi_value(otb["Net_After_Fixed_Costs"], "currency"),
-                "color": _kpi_color(otb["Net_After_Fixed_Costs"]),
-                "note": "future confirmed bookings",
-            },
-            {
-                "label": "Net Profit Full Year",
-                "display": _format_kpi_value(full_year["Net_After_Fixed_Costs"], "currency"),
-                "color": _kpi_color(full_year["Net_After_Fixed_Costs"]),
-                "note": "YTD + on the books",
-            },
-            {
-                "label": "Occupancy YTD / OTB",
-                "display": (
-                    f'{_format_kpi_value(ytd["Occupancy_Rate"], "percent")} / '
-                    f'{_format_kpi_value(otb["Occupancy_Rate"], "percent")}'
-                ),
-                "color": "#111827",
-                "note": "actual / on the books",
-            },
-        ],
-        [
-            {
-                "label": "Gross Revenue YTD",
-                "display": _format_kpi_value(ytd["Gross_Revenue"], "currency"),
-                "color": "#111827",
-                "note": "actual gross revenue",
-            },
-            {
-                "label": "Gross Revenue on the Books",
-                "display": _format_kpi_value(otb["Gross_Revenue"], "currency"),
-                "color": "#111827",
-                "note": "future booked gross revenue",
-            },
-            {
-                "label": "Gross Revenue Full Year",
-                "display": _format_kpi_value(full_year["Gross_Revenue"], "currency"),
-                "color": "#111827",
-                "note": "YTD + on the books",
-            },
-            {
-                "label": "Cleaning Fees Full Year",
-                "display": _format_kpi_value(full_year["Cleaning_Fees"], "currency"),
-                "color": "#111827",
-                "note": "YTD + on the books",
-            },
-        ],
-        [
-            {
-                "label": "ADR YTD",
-                "display": _format_kpi_value(ytd["ADR"], "currency"),
-                "color": "#111827",
-                "note": "gross / occupied night",
-            },
-            {
-                "label": "Variable Costs €/night",
-                "display": _format_kpi_value(ytd["Variable_Cost_Per_Night"], "currency_per_night"),
-                "color": "#dc2626" if variable_cost_warning else "#111827",
-                "note": "cleaning + concierge + energy*",
-            },
-            {
-                "label": "Fixed Costs €/night",
-                "display": _format_kpi_value(ytd["Fixed_Cost_Per_Night"], "currency_per_night"),
-                "color": "#dc2626" if fixed_cost_warning else "#111827",
-                "note": "fixed costs / occupied night",
-            },
-            {
-                "label": "Net €/night",
-                "display": _format_kpi_value(ytd["Net_Per_Night"], "currency_per_night"),
-                "color": _kpi_color(ytd["Net_Per_Night"]),
-                "note": "after variable + fixed costs",
-            },
-        ],
-    ]
+    # Order matters: first the real outcome, then pipeline visibility,
+    # then the profitability funnel from ADR down to net.
+    return {
+        "Net Profit YTD": {
+            "display": _format_kpi_value(ytd["Net_After_Fixed_Costs"], "currency"),
+            "color": _kpi_color(ytd["Net_After_Fixed_Costs"]),
+            "note": "actuals to yesterday",
+        },
+        "Gross Revenue OTB": {
+            "display": _format_kpi_value(otb["Gross_Revenue"], "currency"),
+            "color": "#111827",
+            "note": "future confirmed bookings",
+        },
+        "Occupancy YTD / OTB": {
+            "display": (
+                f'{_format_kpi_value(ytd["Occupancy_Rate"], "percent")} / '
+                f'{_format_kpi_value(otb["Occupancy_Rate"], "percent")}'
+            ),
+            "color": "#111827",
+            "note": "actual / on the books",
+        },
+        "ADR YTD": {
+            "display": _format_kpi_value(ytd["ADR"], "currency"),
+            "color": "#111827",
+            "note": "gross / occupied night",
+        },
+        "Variable €/night": {
+            "display": _format_kpi_value(ytd["Variable_Cost_Per_Night"], "currency_per_night"),
+            "color": "#dc2626" if variable_cost_warning else "#111827",
+            "note": "cleaning + concierge + variable",
+        },
+        "Fixed €/night": {
+            "display": _format_kpi_value(ytd["Fixed_Cost_Per_Night"], "currency_per_night"),
+            "color": "#dc2626" if fixed_cost_warning else "#111827",
+            "note": "fixed costs / occupied night",
+        },
+        "Net €/night": {
+            "display": _format_kpi_value(ytd["Net_Per_Night"], "currency_per_night"),
+            "color": _kpi_color(ytd["Net_Per_Night"]),
+            "note": "after variable + fixed",
+        },
+        "Cleaning % net": {
+            "display": _format_kpi_value(ytd["Cleaning_Pct_Net"], "percent"),
+            "color": "#111827",
+            "note": "cleaning / (gross - concierge)",
+        },
+    }
 
 
 def build_apartment_kpi_table(
@@ -2073,12 +1857,11 @@ def build_apartment_kpi_table(
     daily_expenses_for_report: pd.DataFrame,
     listings: pd.DataFrame,
     today: datetime | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """
-    Build two diagnostic tables by apartment/listing.
+    Build a diagnostic KPI table by apartment/listing.
 
-    Table 1: performance by listing.
-    Table 2: funnel by listing.
+    Columns are a mix of YTD actuals and OTB pipeline metrics.
     """
     daily_ytd, daily_otb, expenses_ytd, expenses_otb = _split_ytd_and_otb(
         daily_for_report,
@@ -2089,8 +1872,7 @@ def build_apartment_kpi_table(
     listings = listings.copy()
     listings["listing"] = listings["listing"].apply(normalise_listing_key)
 
-    performance_rows = []
-    funnel_rows = []
+    rows = []
 
     for _, listing_row in listings.sort_values("listing_name").iterrows():
         listing = normalise_listing_key(listing_row["listing"])
@@ -2106,469 +1888,71 @@ def build_apartment_kpi_table(
             expenses_otb[expenses_otb["listing"].apply(normalise_listing_key) == listing],
         )
 
-        performance_rows.append({
+        rows.append({
             "Listing": listing_name,
             "Net Profit YTD": ytd["Net_After_Fixed_Costs"],
-            "Net Profit on the Books": otb["Net_After_Fixed_Costs"],
-            "Gross YTD": ytd["Gross_Revenue"],
-            "Gross on the Books": otb["Gross_Revenue"],
+            "Gross OTB": otb["Gross_Revenue"],
             "Occupancy YTD": ytd["Occupancy_Rate"],
-            "Occupancy on the Books": otb["Occupancy_Rate"],
-        })
-
-        funnel_rows.append({
-            "Listing": listing_name,
+            "Occupancy OTB": otb["Occupancy_Rate"],
             "ADR YTD": ytd["ADR"],
-            "Variable Costs €/night": ytd["Variable_Cost_Per_Night"],
-            "Cleaning % net": ytd["Cleaning_Pct_Net"],
-            "Fixed Costs €/night": ytd["Fixed_Cost_Per_Night"],
+            "Variable €/night": ytd["Variable_Cost_Per_Night"],
+            "Fixed €/night": ytd["Fixed_Cost_Per_Night"],
             "Net €/night": ytd["Net_Per_Night"],
+            "Cleaning % net": ytd["Cleaning_Pct_Net"],
         })
 
-    performance_table = pd.DataFrame(performance_rows)
-    funnel_table = pd.DataFrame(funnel_rows)
+    table = pd.DataFrame(rows)
 
-    performance_currency_cols = [
+    currency_cols = [
         "Net Profit YTD",
-        "Net Profit on the Books",
-        "Gross YTD",
-        "Gross on the Books",
-    ]
-
-    performance_percent_cols = [
-        "Occupancy YTD",
-        "Occupancy on the Books",
-    ]
-
-    funnel_currency_cols = [
+        "Gross OTB",
         "ADR YTD",
-        "Variable Costs €/night",
-        "Fixed Costs €/night",
+        "Variable €/night",
+        "Fixed €/night",
         "Net €/night",
     ]
 
-    funnel_percent_cols = ["Cleaning % net"]
+    percent_cols = [
+        "Occupancy YTD",
+        "Occupancy OTB",
+        "Cleaning % net",
+    ]
 
-    for col in performance_currency_cols:
-        performance_table[col] = performance_table[col].apply(
+    for col in currency_cols:
+        table[col] = table[col].apply(
             lambda value: "—" if pd.isna(value) else f"{value:,.0f} €"
         )
 
-    for col in performance_percent_cols:
-        performance_table[col] = performance_table[col].apply(
+    for col in percent_cols:
+        table[col] = table[col].apply(
             lambda value: "—" if pd.isna(value) else f"{value * 100:,.0f}%"
         )
 
-    for col in funnel_currency_cols:
-        funnel_table[col] = funnel_table[col].apply(
-            lambda value: "—" if pd.isna(value) else f"{value:,.0f} €"
+    return table
+
+
+def render_finance_kpi_cards(kpis: dict) -> str:
+    cards = []
+
+    for label, item in kpis.items():
+        cards.append(
+            f'<td style="width:33.33%; background:white; padding:14px; border-radius:8px; border:1px solid #e5e7eb; vertical-align:top;">'
+            f'<div style="font-size:12px; color:#666;">{label}</div>'
+            f'<div style="font-size:24px; font-weight:bold; color:{item["color"]}; margin-top:4px;">{item["display"]}</div>'
+            f'<div style="font-size:11px; color:#777; margin-top:4px;">{item["note"]}</div>'
+            f'</td>'
         )
 
-    for col in funnel_percent_cols:
-        funnel_table[col] = funnel_table[col].apply(
-            lambda value: "—" if pd.isna(value) else f"{value * 100:,.0f}%"
-        )
-
-    return performance_table, funnel_table
-
-
-def render_finance_kpi_cards(kpi_rows: list[list[dict]]) -> str:
-    """Render KPI rows. Each inner list becomes one row of equal-width cards."""
-    rows_html = []
-
-    for row in kpi_rows:
-        width = 100 / max(len(row), 1)
-        cells = []
-
-        for item in row:
-            cells.append(
-                f'<td style="width:{width:.2f}%; background:white; padding:14px; border-radius:8px; border:1px solid #e5e7eb; vertical-align:top;">'
-                f'<div style="font-size:12px; color:#666;">{item["label"]}</div>'
-                f'<div style="font-size:24px; font-weight:bold; color:{item["color"]}; margin-top:4px;">{item["display"]}</div>'
-                f'<div style="font-size:11px; color:#777; margin-top:4px;">{item["note"]}</div>'
-                f'</td>'
-            )
-
-        rows_html.append("<tr>" + "".join(cells) + "</tr>")
+    rows = []
+    for i in range(0, len(cards), 3):
+        rows.append("<tr>" + "".join(cards[i:i+3]) + "</tr>")
 
     return (
         '<table role="presentation" style="width:100%; margin-top:16px; border-collapse:separate; border-spacing:8px;">'
-        + "".join(rows_html)
+        + "".join(rows)
         + "</table>"
     )
 
-
-
-
-def _html_escape(value) -> str:
-    """Minimal HTML escaping for model output and error messages."""
-    text = "" if value is None else str(value)
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def _safe_number(value):
-    """Return JSON-safe rounded numbers; convert NaN/NA to None."""
-    if pd.isna(value):
-        return None
-    try:
-        return round(float(value), 4)
-    except (TypeError, ValueError):
-        return value
-
-
-def build_ai_analysis_payload(
-    daily_for_report: pd.DataFrame,
-    daily_expenses_for_report: pd.DataFrame,
-    listings: pd.DataFrame,
-    report_group_label: str,
-    today: datetime | None = None,
-) -> dict:
-    """
-    Build a compact, deterministic payload for GenAI analysis.
-
-    The model receives Python-computed metrics only. It should explain and
-    prioritise, not calculate.
-    """
-    daily_ytd, daily_otb, expenses_ytd, expenses_otb = _split_ytd_and_otb(
-        daily_for_report,
-        daily_expenses_for_report,
-        today=today,
-    )
-
-    def clean_metrics(metrics: dict) -> dict:
-        return {key: _safe_number(value) for key, value in metrics.items()}
-
-    ytd = _calculate_period_metrics(daily_ytd, expenses_ytd)
-    otb = _calculate_period_metrics(daily_otb, expenses_otb)
-
-    listings = listings.copy()
-    listings["listing"] = listings["listing"].apply(normalise_listing_key)
-
-    listing_rows = []
-    for _, listing_row in listings.sort_values("listing_name").iterrows():
-        listing = normalise_listing_key(listing_row["listing"])
-        listing_name = listing_row["listing_name"]
-
-        listing_ytd = _calculate_period_metrics(
-            daily_ytd[daily_ytd["listing"].apply(normalise_listing_key) == listing],
-            expenses_ytd[expenses_ytd["listing"].apply(normalise_listing_key) == listing],
-        )
-        listing_otb = _calculate_period_metrics(
-            daily_otb[daily_otb["listing"].apply(normalise_listing_key) == listing],
-            expenses_otb[expenses_otb["listing"].apply(normalise_listing_key) == listing],
-        )
-
-        listing_rows.append({
-            "listing": listing_name,
-            "YTD": clean_metrics(listing_ytd),
-            "OTB": clean_metrics(listing_otb),
-        })
-
-    return {
-        "report_group": report_group_label,
-        "definitions": {
-            "YTD": "actual dates before today",
-            "OTB": "future confirmed bookings from today onward",
-            "Full Year": "YTD actuals plus OTB confirmed future bookings",
-            "ADR": "gross revenue divided by occupied nights",
-            "Variable_Cost_Per_Night": "cleaning + concierge + energy/usage-based variable expenses divided by occupied nights",
-            "Fixed_Cost_Per_Night": "fixed expenses divided by occupied nights",
-            "Cleaning_Pct_Net": "cleaning fees divided by gross revenue minus concierge fees",
-            "Net_Per_Night": "net after variable and fixed costs divided by occupied nights",
-        },
-        "headline_metrics": {
-            "YTD": clean_metrics(ytd),
-            "OTB": clean_metrics(otb),
-            "Full_Year": {
-                "Gross_Revenue": _safe_number(ytd["Gross_Revenue"] + otb["Gross_Revenue"]),
-                "Net_After_Fixed_Costs": _safe_number(ytd["Net_After_Fixed_Costs"] + otb["Net_After_Fixed_Costs"]),
-                "Cleaning_Fees": _safe_number(ytd["Cleaning_Fees"] + otb["Cleaning_Fees"]),
-            },
-        },
-        "listing_metrics": listing_rows,
-        "analysis_instruction": "Prioritise actionable insights. Identify the largest causes of losses and the listings that need attention.",
-    }
-
-
-def _render_ai_list(items) -> str:
-    if not items:
-        return "<p style='font-size:13px; color:#777; margin:0;'>No specific points returned.</p>"
-    lis = "".join(f"<li>{_html_escape(item)}</li>" for item in items)
-    return f"<ul style='margin:6px 0 0 18px; padding:0; font-size:13px; line-height:1.45;'>{lis}</ul>"
-
-
-def render_ai_insights_json(ai_text: str) -> str:
-    import json
-    import re
-    import html
-
-    cleaned = ai_text.strip()
-
-    # Remove ```json ... ``` or ``` ... ```
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        escaped = html.escape(ai_text)
-        return f"<pre style='white-space:pre-wrap; font-family:Arial, sans-serif;'>{escaped}</pre>"
-
-    sections = [
-        ("🔴 Critical Issues", "critical_issues", "#dc2626"),
-        ("🟡 Key Drivers", "key_drivers", "#f59e0b"),
-        ("🟢 Recommended Actions", "recommended_actions", "#16a34a"),
-        ("⚪ Data Gaps", "data_gaps", "#6b7280"),
-    ]
-
-    output = ""
-
-    for title, key, color in sections:
-        items = data.get(key, [])
-        if not items:
-            continue
-
-        output += f"<h4 style='margin:12px 0 6px 0; color:{color};'>{title}</h4>"
-        output += "<ul style='margin-top:0; padding-left:20px;'>"
-
-        for item in items:
-            output += f"<li>{html.escape(str(item))}</li>"
-
-        output += "</ul>"
-
-    return output
-
-def _plain_ai_fallback_to_html(text: str) -> str:
-    lines = [_html_escape(line) for line in text.splitlines() if line.strip()]
-    body = "".join(f"<p style='font-size:13px; line-height:1.45; margin:0 0 8px 0;'>{line}</p>" for line in lines)
-    return f"""
-    <div style="background:white; padding:16px; margin-top:16px; border-radius:8px; border:1px solid #e5e7eb;">
-      <h3 style="margin-top:0;">AI Insights & Actions</h3>
-      <p style="font-size:12px; color:#666; margin-top:0;">
-      Generated from Python-calculated KPI tables and listing-level metrics. Calculations are still performed by Python.
-      </p>
-      {body}
-    </div>
-    """
-
-
-def generate_ai_insights_html(
-    daily_for_report: pd.DataFrame,
-    daily_expenses_for_report: pd.DataFrame,
-    listings: pd.DataFrame,
-    report_group_label: str,
-    enabled: bool = False,
-) -> str:
-
-    if not enabled:
-        return ""
-
-    if OpenAI is None:
-        return """
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px; border:1px solid #e5e7eb;">
-          <h3 style="margin-top:0;">AI Insights & Actions</h3>
-          <p style="font-size:13px; color:#666;">
-          AI insights requested but OpenAI package not installed.
-          </p>
-        </div>
-        """
-
-    if not os.environ.get("OPENAI_API_KEY"):
-        return """
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px; border:1px solid #e5e7eb;">
-          <h3 style="margin-top:0;">AI Insights & Actions</h3>
-          <p style="font-size:13px; color:#666;">
-          OPENAI_API_KEY not set.
-          </p>
-        </div>
-        """
-
-    payload = build_ai_analysis_payload(
-        daily_for_report,
-        daily_expenses_for_report,
-        listings,
-        report_group_label,
-    )
-
-    prompt = f"""
-Tu es un analyste pragmatique spécialisé dans la rentabilité de locations courte durée.
-
-Objectif :
-Fournir des insights utiles et directement actionnables, pas un résumé.
-
-Règles d’interprétation IMPORTANTES :
-
-- Le coût fixe par nuit augmente mécaniquement quand le taux d’occupation est faible.
-- Ne mentionner les coûts fixes qu’UNE SEULE FOIS maximum, sauf anomalie évidente.
-- Ne pas surinterpréter les coûts fixes.
-
-- Les coûts fixes sont peu actionnables à court terme.
-- Prioriser les leviers réellement actionnables :
-  - taux d’occupation
-  - niveau de prix
-  - durée de séjour
-  - coûts variables (ménage, conciergerie, énergie)
-  - performance par logement
-
-- Ne PAS utiliser le taux d’occupation sur l’année complète comme indicateur principal.
-- Se concentrer sur :
-  - le réalisé depuis le début de l’année
-  - les réservations confirmées à venir
-
-- Ne PAS utiliser de noms de variables, ni d’anglais technique (ADR, YTD, OTB, etc).
-- Utiliser uniquement un langage naturel en français.
-
-- Distinguer clairement les causes :
-  1. manque d’occupation
-  2. prix inadapté
-  3. coûts variables trop élevés
-  4. problème structurel réel
-
-Format attendu :
-
-- Répondre en FRANÇAIS uniquement
-- Être concis et concret
-- Maximum :
-  - 3 points critiques
-  - 3 facteurs explicatifs
-  - 3 actions recommandées
-- Pas de répétition
-- Pas de phrases longues
-Commencer par le problème le plus important économiquement.
-
-Contexte saisonnier :
-- Utiliser une connaissance générale de la saisonnalité des locations courte durée en zone touristique côtière française (bretagne).
-- Ne pas inventer de chiffres de marché.
-- Tenir compte du fait que l’hiver et le début de printemps peuvent être faibles, tandis que l’été est normalement beaucoup plus porteur.
-- Ne pas conclure trop vite qu’un faible taux d’occupation en basse saison est structurel.
-Quand tu analyses les réservations confirmées à venir, tiens compte du calendrier : une faible occupation future peut être normale si la période est encore éloignée ou hors saison, mais plus préoccupante si l’on approche d’une période normalement forte.
-- Distinguer :
-  1. faiblesse normale de basse saison,
-  2. faiblesse inquiétante des réservations à venir,
-  3. problème spécifique à un logement.
-- Si une recommandation dépend de la saison, le dire explicitement.
-
-Retourner UNIQUEMENT du JSON valide :
-
-{{
-  "critical_issues": [],
-  "key_drivers": [],
-  "recommended_actions": [],
-  "data_gaps": []
-}}
-
-Données :
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-"""
-
-    try:
-        client = OpenAI()
-        response = client.responses.create(
-            model=os.environ.get("OPENAI_INSIGHTS_MODEL", "gpt-4.1-mini"),
-            input=prompt,
-        )
-
-        ai_text = response.output_text.strip()
-
-        # Extract JSON safely
-        start = ai_text.find("{")
-        end = ai_text.rfind("}")
-
-        if start == -1 or end == -1:
-            return f"<pre>{_html_escape(ai_text)}</pre>"
-
-        json_text = ai_text[start:end + 1]
-
-        try:
-            sections = json.loads(json_text)
-        except json.JSONDecodeError:
-            return f"<pre>{_html_escape(ai_text)}</pre>"
-
-        return render_structured_ai_insights(sections)
-
-    except Exception as exc:
-        return f"""
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px; border:1px solid #e5e7eb;">
-          <h3>AI Insights & Actions</h3>
-          <p style="color:#666;">OpenAI error: {_html_escape(str(exc))}</p>
-        </div>
-        """
-    
-def render_structured_ai_insights(sections: dict) -> str:
-    section_config = [
-        ("critical_issues", "🔴 Points critiques", "#dc2626"),
-        ("key_drivers", "🟡 Facteurs explicatifs", "#f59e0b"),
-        ("recommended_actions", "🟢 Actions recommandées", "#16a34a"),
-        ("data_gaps", "⚪ Données manquantes", "#6b7280"),
-    ]
-
-    html_parts = []
-
-    for key, title, color in section_config:
-        items = sections.get(key, [])
-
-        if not items:
-            continue
-
-        html_parts.append(
-            f'<h4 style="margin:14px 0 6px 0; color:{color};">{title}</h4>'
-        )
-        html_parts.append('<ul style="margin-top:0; padding-left:20px;">')
-
-        for item in items:
-            html_parts.append(f"<li>{_html_escape(item)}</li>")
-
-        html_parts.append("</ul>")
-
-    if not html_parts:
-        return """
-        <p style="font-size:13px; color:#666;">
-        Aucune analyse structurée n’a été générée.
-        </p>
-        """
-
-    return "\n".join(html_parts)
-
-def render_ai_insights_json(ai_text: str) -> str:
-    import json
-    import re
-
-    # Remove markdown fences if the model returns ```json ... ```
-    cleaned = re.sub(r"^```json\s*|\s*```$", "", ai_text.strip(), flags=re.MULTILINE)
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        return f"<pre style='white-space:pre-wrap;'>{ai_text}</pre>"
-
-    sections = [
-        ("🔴 Critical Issues", "critical_issues", "#dc2626"),
-        ("🟡 Key Drivers", "key_drivers", "#f59e0b"),
-        ("🟢 Recommended Actions", "recommended_actions", "#16a34a"),
-        ("⚪ Data Gaps", "data_gaps", "#6b7280"),
-    ]
-
-    html = ""
-
-    for title, key, color in sections:
-        items = data.get(key, [])
-        if not items:
-            continue
-
-        html += f"<h4 style='margin-bottom:6px; color:{color};'>{title}</h4>"
-        html += "<ul style='margin-top:0;'>"
-
-        for item in items:
-            html += f"<li>{item}</li>"
-
-        html += "</ul>"
-
-    return html
 
 def build_finance_email_html(
     gross_revenue_pivot: pd.DataFrame,
@@ -2580,48 +1964,59 @@ def build_finance_email_html(
     concierge_fees_pivot: pd.DataFrame,
     cleaning_pct_net_pivot: pd.DataFrame,
     finance_chart_path: Path,
-    listing_net_chart_path: Path,
-    occupancy_chart_path: Path,
-    finance_kpis: list[list[dict]],
-    performance_by_listing_table: pd.DataFrame,
-    funnel_table: pd.DataFrame,
-    ai_insights_html: str = "",
+    listing_ytd_net_chart_path: Path,
+    finance_kpis: dict,
+    apartment_kpi_table: pd.DataFrame,
     report_group_label: str = "All groups",
 ) -> str:
-
+    
     chart_src = image_to_base64_data_uri(finance_chart_path)
-    listing_net_chart_src = image_to_base64_data_uri(listing_net_chart_path)
-    occupancy_chart_src = image_to_base64_data_uri(occupancy_chart_path)
+    listing_ytd_chart_src = image_to_base64_data_uri(listing_ytd_net_chart_path)
     kpi_cards = render_finance_kpi_cards(finance_kpis)
-
-    performance_by_listing_html = dataframe_to_html_table(
-        performance_by_listing_table,
-        color_percentages=False,
+    
+    gross_table = dataframe_to_html_table(
+        gross_revenue_pivot,
+        currency_columns=[col for col in gross_revenue_pivot.columns if col not in ["listing_name"]]
     )
 
-    funnel_html = dataframe_to_html_table(
-        funnel_table,
-        color_percentages=False,
-    )
+    currency_cols_gross = [
+        col for col in gross_revenue_pivot.columns
+        if col != "listing_name"
+    ]
+
+    currency_cols_contribution = [
+        col for col in contribution_pivot.columns
+        if col != "listing_name"
+    ]
+
+    currency_cols_ADR = [
+        col for col in ADR_pivot.columns
+        if col != "listing_name"
+    ]
 
     gross_table = dataframe_to_html_table(
         gross_revenue_pivot,
-        currency_columns=[col for col in gross_revenue_pivot.columns if col != "listing_name"],
+        currency_columns=currency_cols_gross,
     )
 
     contribution_table = dataframe_to_html_table(
         contribution_pivot,
-        currency_columns=[col for col in contribution_pivot.columns if col != "listing_name"],
+        currency_columns=currency_cols_contribution,
+    )
+
+    contribution_table = dataframe_to_html_table(
+    contribution_pivot,
+    currency_columns=[col for col in contribution_pivot.columns if col != "index"]
     )
 
     net_table = dataframe_to_html_table(
-        net_after_fixed_pivot,
-        currency_columns=[col for col in net_after_fixed_pivot.columns if col != "listing_name"],
+    net_after_fixed_pivot,
+    currency_columns=[col for col in net_after_fixed_pivot.columns if col != "index"]
     )
 
     ADR_table = dataframe_to_html_table(
-        ADR_pivot,
-        currency_columns=[col for col in ADR_pivot.columns if col != "listing_name"],
+    ADR_pivot,
+    currency_columns=[col for col in ADR_pivot.columns if col != "index"]
     )
 
     occupancy_table = dataframe_to_html_table(occupancy_pivot)
@@ -2641,6 +2036,18 @@ def build_finance_email_html(
         color_percentages=False,
     )
 
+    apartment_kpis_html = dataframe_to_html_table(
+        apartment_kpi_table,
+        currency_columns=[
+            "ADR_YTD",
+            "Variable_Fees_Per_Night",
+            "Fixed_Fees_Per_Night",
+            "Net_Per_Night",
+            "Net_Profit_YTD",
+            "OTB_Revenue",
+        ],
+    )
+
     html = f"""
     <html>
     <body style="margin:0; padding:0; background:#f6f7f9; font-family:Arial, sans-serif; color:#222;">
@@ -2653,7 +2060,18 @@ def build_finance_email_html(
 
         {kpi_cards}
 
-        {ai_insights_html}
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Profitability Funnel by Apartment</h3>
+        <p style="font-size:12px; color:#666; margin-top:0;">
+        YTD columns show actual performance to yesterday. OTB columns show confirmed future bookings.
+        </p>
+        {apartment_kpis_html}
+        </div>
+
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">YTD Net Revenue by Listing</h3>
+        <img src="{listing_ytd_chart_src}" style="width:100%; max-width:900px;">
+        </div>
 
         <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
         <h3 style="margin-top:0;">Cumulative Performance — Actual + On the Books</h3>
@@ -2661,53 +2079,6 @@ def build_finance_email_html(
         Solid lines are actuals. Dashed lines are future on-the-books values. The vertical line marks today.
         </p>
         <img src="{chart_src}" style="width:100%; max-width:900px;">
-        </div>
-
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
-        <h3 style="margin-top:0;">Performance by Listing</h3>
-        <p style="font-size:12px; color:#666; margin-top:0;">
-        YTD columns show actual performance to yesterday. On-the-books columns show confirmed future bookings.
-        </p>
-        {performance_by_listing_html}
-        </div>
-
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
-        <h3 style="margin-top:0;">Profitability Funnel by Listing</h3>
-        <p style="font-size:12px; color:#666; margin-top:0;">
-        Funnel values are YTD actuals. Variable costs per night include cleaning, concierge and energy/usage-based variable expenses.
-        </p>
-        {funnel_html}
-        </div>
-
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
-        <h3 style="margin-top:0;">Net Revenue by Listing — Actual + On the Books</h3>
-        <p style="font-size:12px; color:#666; margin-top:0;">
-        Solid lines are actuals. Dashed lines are future on-the-books values. The vertical line marks today.
-        </p>
-        <img src="{listing_net_chart_src}" style="width:100%; max-width:900px;">
-        </div>
-
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
-        <h3 style="margin-top:0;">Occupancy by Listing — Actual + On the Books</h3>
-        <p style="font-size:12px; color:#666; margin-top:0;">
-        One line per listing. Solid lines are actual months. Dashed lines are current/future on-the-books months. The vertical line marks today.
-        </p>
-        <img src="{occupancy_chart_src}" style="width:100%; max-width:900px;">
-        </div>
-
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
-          <h3 style="margin-top:0;">Gross Revenue</h3>
-          {gross_table}
-        </div>
-
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
-        <h3 style="margin-top:0;">Cleaning Fees</h3>
-        {cleaning_table}
-        </div>
-
-        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
-        <h3 style="margin-top:0;">Cleaning Fees % of Net Revenue</h3>
-        {cleaning_pct_table}
         </div>
 
         <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
@@ -2721,13 +2092,28 @@ def build_finance_email_html(
         </div>
 
         <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
-        <h3 style="margin-top:0;">Average Daily Rate</h3>
-        {ADR_table}
+          <h3 style="margin-top:0;">Gross Revenue</h3>
+          {gross_table}
         </div>
 
         <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Cleaning Fees % of Net Revenue</h3>
+        {cleaning_pct_table}
+        </div>
+
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Average Daily Rate</h3>
+        {ADR_table}
+        </div>
+        
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
         <h3 style="margin-top:0;">Occupancy</h3>
         {occupancy_table}
+        </div>
+        
+        <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
+        <h3 style="margin-top:0;">Cleaning Fees</h3>
+        {cleaning_table}
         </div>
 
         <div style="background:white; padding:16px; margin-top:16px; border-radius:8px;">
@@ -2739,6 +2125,7 @@ def build_finance_email_html(
     </html>
     """
     return html
+
 
 
 def build_cumulative_finance_chart(
@@ -2922,7 +2309,6 @@ def main() -> None:
     print(f"Source: {source}")
     print(f"Output: {output_dir}")
     print(f"Finance groups: {group_label(selected_groups)}")
-    print(f"AI insights: {args.ai_insights}")
 
     if source == "excel":
         if input_path is None:
@@ -3158,7 +2544,7 @@ def main() -> None:
         daily_expenses_for_report,
     )
 
-    performance_by_listing_table, funnel_table = build_apartment_kpi_table(
+    apartment_kpi_table = build_apartment_kpi_table(
         daily_for_report,
         daily_expenses_for_report,
         finance_listings,
@@ -3185,8 +2571,7 @@ def main() -> None:
     df_expanded_daily_expenses.to_csv(output_dir / "expenses_long.csv", index=False)
 
     final.to_csv(output_dir / "daily_performance.csv", index=False)
-    performance_by_listing_table.to_csv(output_dir / f"performance_by_listing_{group_slug(selected_groups)}.csv", index=False)
-    funnel_table.to_csv(output_dir / f"funnel_by_listing_{group_slug(selected_groups)}.csv", index=False)
+    apartment_kpi_table.to_csv(output_dir / f"apartment_kpis_{group_slug(selected_groups)}.csv", index=False)
 
     print("Reservations loaded and validated successfully.")
     print(f"Outputs saved to: {output_dir}")
@@ -3252,26 +2637,10 @@ def main() -> None:
             filename_suffix=group_slug(selected_groups),
         )
 
-        listing_net_chart_path = build_listing_ytd_net_chart(
-            daily_for_report,
-            daily_expenses_for_report,
-            finance_listings,
+        listing_ytd_net_chart_path = build_listing_ytd_net_chart(
+            monthly_finance,
             output_dir,
             filename_suffix=group_slug(selected_groups),
-        )
-
-        occupancy_chart_path = build_monthly_occupancy_chart(
-            monthly_occupancy,
-            output_dir,
-            filename_suffix=group_slug(selected_groups),
-        )
-
-        ai_insights_html = generate_ai_insights_html(
-            daily_for_report,
-            daily_expenses_for_report,
-            finance_listings,
-            report_group_label=group_label(selected_groups),
-            enabled=args.ai_insights,
         )
 
         html = build_finance_email_html(
@@ -3284,12 +2653,9 @@ def main() -> None:
             concierge_fees_pivot,
             cleaning_pct_net_pivot,
             finance_chart_path,
-            listing_net_chart_path,
-            occupancy_chart_path,
+            listing_ytd_net_chart_path,
             finance_kpis,
-            performance_by_listing_table,
-            funnel_table,
-            ai_insights_html=ai_insights_html,
+            apartment_kpi_table,
             report_group_label=group_label(selected_groups),
         )
 
