@@ -964,32 +964,27 @@ def build_weekly_occupancy(
     today: datetime | None = None,
     weeks_ahead: int = 8
 ) -> pd.DataFrame:
-    """
-    Build weekly occupancy by listing for the next N weeks.
-
-    Uses daily occupancy table:
-    - one row per date + listing
-    - occupied = 0/1
-    """
 
     if today is None:
         today = datetime.today()
 
-    start_date = pd.Timestamp(today.date())
+    today_ts = pd.Timestamp(today.date())
 
-    # roughly next 2 months = 8 weeks
+    # Start from Monday of the current week, not today,
+    # so the first displayed week has a full 7-day denominator.
+    start_date = today_ts - pd.to_timedelta(today_ts.weekday(), unit="D")
+
+    # Include full weeks
     end_date = start_date + pd.Timedelta(weeks=weeks_ahead)
 
     df = daily.copy()
     df["date"] = pd.to_datetime(df["date"])
 
-    # Keep only future dates in the selected horizon
     df = df[
         (df["date"] >= start_date) &
         (df["date"] < end_date)
     ]
 
-    # Week starts on Monday
     df["week_start"] = df["date"] - pd.to_timedelta(df["date"].dt.weekday, unit="D")
     df["week_end"] = df["week_start"] + pd.Timedelta(days=6)
 
