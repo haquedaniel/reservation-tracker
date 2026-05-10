@@ -66,6 +66,7 @@
                 "--dry-run",
                 "--source", "google-sheets",
                 "--groups", "Peskerezh",
+                "--ai-insights",
                 "--output", "output"
             ]
         },  

@@ -1981,22 +1981,22 @@ def build_finance_kpis(
     return [
         [
             {
+                "label": "Net Profit Full Year",
+                "display": _format_kpi_value(full_year["Net_After_Fixed_Costs"], "currency"),
+                "color": _kpi_color(full_year["Net_After_Fixed_Costs"]),
+                "note": "YTD + on the books",
+            },
+            {
                 "label": "Net Profit YTD",
                 "display": _format_kpi_value(ytd["Net_After_Fixed_Costs"], "currency"),
                 "color": _kpi_color(ytd["Net_After_Fixed_Costs"]),
                 "note": "actuals to yesterday",
             },
             {
-                "label": "Net Profit on the Books",
+                "label": "Net Profit rest of year",
                 "display": _format_kpi_value(otb["Net_After_Fixed_Costs"], "currency"),
                 "color": _kpi_color(otb["Net_After_Fixed_Costs"]),
                 "note": "future confirmed bookings",
-            },
-            {
-                "label": "Net Profit Full Year",
-                "display": _format_kpi_value(full_year["Net_After_Fixed_Costs"], "currency"),
-                "color": _kpi_color(full_year["Net_After_Fixed_Costs"]),
-                "note": "YTD + on the books",
             },
             {
                 "label": "Occupancy YTD / OTB",
@@ -2010,23 +2010,25 @@ def build_finance_kpis(
         ],
         [
             {
-                "label": "Gross Revenue YTD",
-                "display": _format_kpi_value(ytd["Gross_Revenue"], "currency"),
-                "color": "#111827",
-                "note": "actual gross revenue",
-            },
-            {
-                "label": "Gross Revenue on the Books",
-                "display": _format_kpi_value(otb["Gross_Revenue"], "currency"),
-                "color": "#111827",
-                "note": "future booked gross revenue",
-            },
-            {
                 "label": "Gross Revenue Full Year",
                 "display": _format_kpi_value(full_year["Gross_Revenue"], "currency"),
                 "color": "#111827",
                 "note": "YTD + on the books",
             },
+            {
+                "label": "Gross Revenue to date",
+                "display": _format_kpi_value(ytd["Gross_Revenue"], "currency"),
+                "color": "#111827",
+                "note": "actual gross revenue",
+            },
+            {
+                "label": "Gross Revenue rest of year",
+                "display": _format_kpi_value(otb["Gross_Revenue"], "currency"),
+                "color": "#111827",
+                "note": "future booked gross revenue",
+            },
+
+
             {
                 "label": "Cleaning Fees Full Year",
                 "display": _format_kpi_value(full_year["Cleaning_Fees"], "currency"),
@@ -2216,11 +2218,277 @@ def _safe_number(value):
         return value
 
 
+def classify_rental_model(avg_stay_length: float | None, max_stay_length: float | None) -> str:
+    """
+    Simple heuristic to help the AI distinguish short-stay vs medium/long-stay activity.
+    """
+    if avg_stay_length is None or pd.isna(avg_stay_length):
+        return "unknown"
+
+    if max_stay_length is not None and max_stay_length >= 90:
+        return "medium_or_long_term"
+
+    if avg_stay_length >= 30:
+        return "medium_or_long_term"
+
+    if avg_stay_length >= 14:
+        return "extended_short_stay"
+
+    return "short_stay"
+
+
+def build_listing_booking_profile(
+    reservations: pd.DataFrame,
+    listings: pd.DataFrame,
+) -> list[dict]:
+
+    df = reservations.copy()
+    listings = listings.copy()
+
+    df["listing"] = df["listing"].apply(normalise_listing_key)
+    listings["listing"] = listings["listing"].apply(normalise_listing_key)
+
+    # Avoid duplicate listing_name columns if reservations is already enriched
+    if "listing_name" not in df.columns:
+        df = df.merge(
+            listings[["listing", "listing_name"]],
+            on="listing",
+            how="left",
+        )
+
+    df["listing_name"] = df["listing_name"].fillna(df["listing"])
+
+    rows = []
+
+    for listing_name, group in df.groupby("listing_name"):
+        avg_stay = group["nights"].mean()
+        max_stay = group["nights"].max()
+
+        rows.append({
+            "listing": listing_name,
+            "bookings_count": int(len(group)),
+            "average_stay_length": _safe_number(avg_stay),
+            "max_stay_length": _safe_number(max_stay),
+            "rental_model": classify_rental_model(avg_stay, max_stay),
+        })
+
+    return rows
+
+def build_monthly_listing_performance(
+    daily_for_report: pd.DataFrame,
+    daily_expenses_for_report: pd.DataFrame,
+    listings: pd.DataFrame,
+    today: datetime | None = None,
+) -> list[dict]:
+    """
+    Build compact monthly performance by listing for AI analysis.
+
+    This gives the model the shape of performance over time without sending
+    raw daily data.
+    """
+    if today is None:
+        today = datetime.today()
+
+    today_ts = pd.Timestamp(today).normalize()
+
+    daily = daily_for_report.copy()
+    expenses = daily_expenses_for_report.copy()
+    listings = listings.copy()
+
+    daily["date"] = pd.to_datetime(daily["date"])
+    expenses["date"] = pd.to_datetime(expenses["date"])
+
+    daily["listing"] = daily["listing"].apply(normalise_listing_key)
+    expenses["listing"] = expenses["listing"].apply(normalise_listing_key)
+    listings["listing"] = listings["listing"].apply(normalise_listing_key)
+
+    daily["year_month"] = daily["date"].dt.strftime("%Y-%m")
+    expenses["year_month"] = expenses["date"].dt.strftime("%Y-%m")
+
+    revenue_monthly = (
+        daily.groupby(["listing", "year_month"], as_index=False)
+        .agg(
+            available_nights=("date", "count"),
+            booked_nights=("occupied", "sum"),
+            gross_revenue=("daily_revenue_total", "sum"),
+            cleaning_fees=("daily_cleaning_fees", "sum"),
+            concierge_fees=("daily_concierge_commission", "sum"),
+        )
+    )
+
+    expenses_monthly = (
+        expenses.groupby(["listing", "year_month", "expense_type"], as_index=False)
+        .agg(expense=("daily_expense", "sum"))
+        .pivot_table(
+            index=["listing", "year_month"],
+            columns="expense_type",
+            values="expense",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        .reset_index()
+    )
+
+    if "variable" not in expenses_monthly.columns:
+        expenses_monthly["variable"] = 0
+
+    if "fixed" not in expenses_monthly.columns:
+        expenses_monthly["fixed"] = 0
+
+    monthly = revenue_monthly.merge(
+        expenses_monthly[["listing", "year_month", "variable", "fixed"]],
+        on=["listing", "year_month"],
+        how="left",
+    )
+
+    monthly[["variable", "fixed"]] = monthly[["variable", "fixed"]].fillna(0)
+
+    monthly["occupancy"] = (
+        monthly["booked_nights"] / monthly["available_nights"].replace(0, pd.NA)
+    )
+
+    monthly["adr"] = (
+        monthly["gross_revenue"] / monthly["booked_nights"].replace(0, pd.NA)
+    )
+
+    monthly["contribution_before_fixed"] = (
+        monthly["gross_revenue"]
+        - monthly["cleaning_fees"]
+        - monthly["concierge_fees"]
+        - monthly["variable"]
+    )
+
+    monthly["net_after_fixed"] = (
+        monthly["contribution_before_fixed"]
+        - monthly["fixed"]
+    )
+
+    monthly["period_type"] = monthly["year_month"].apply(
+        lambda ym: (
+            "past_or_current"
+            if pd.Timestamp(f"{ym}-01") <= today_ts.replace(day=1)
+            else "future_on_the_books"
+        )
+    )
+
+    monthly = monthly.merge(
+        listings[["listing", "listing_name"]],
+        on="listing",
+        how="left",
+    )
+
+    monthly["listing_name"] = monthly["listing_name"].fillna(monthly["listing"])
+
+    keep_cols = [
+        "listing_name",
+        "year_month",
+        "period_type",
+        "available_nights",
+        "booked_nights",
+        "occupancy",
+        "gross_revenue",
+        "adr",
+        "cleaning_fees",
+        "concierge_fees",
+        "variable",
+        "contribution_before_fixed",
+        "net_after_fixed",
+    ]
+
+    monthly = monthly[keep_cols].sort_values(["listing_name", "year_month"])
+
+    records = []
+    for _, row in monthly.iterrows():
+        records.append({
+            "listing": row["listing_name"],
+            "month": row["year_month"],
+            "period_type": row["period_type"],
+            "available_nights": int(row["available_nights"]),
+            "booked_nights": int(row["booked_nights"]),
+            "occupancy": _safe_number(row["occupancy"]),
+            "gross_revenue": _safe_number(row["gross_revenue"]),
+            "average_nightly_rate": _safe_number(row["adr"]),
+            "cleaning_fees": _safe_number(row["cleaning_fees"]),
+            "concierge_fees": _safe_number(row["concierge_fees"]),
+            "variable_costs": _safe_number(row["variable"]),
+            "contribution_before_fixed": _safe_number(row["contribution_before_fixed"]),
+            "net_after_fixed": _safe_number(row["net_after_fixed"]),
+        })
+
+    return records
+
+
+def build_listing_signals(
+    monthly_listing_performance: list[dict],
+    booking_profiles: list[dict],
+) -> list[dict]:
+    """
+    Pre-compute simple diagnostic signals to guide the AI.
+
+    This helps avoid the AI over-focusing on fixed costs.
+    """
+    performance = pd.DataFrame(monthly_listing_performance)
+    profiles = pd.DataFrame(booking_profiles)
+
+    if performance.empty:
+        return []
+
+    signals = []
+
+    for listing, group in performance.groupby("listing"):
+        future = group[group["period_type"] == "future_on_the_books"]
+        past = group[group["period_type"] == "past_or_current"]
+
+        avg_future_occupancy = future["occupancy"].dropna().mean() if not future.empty else pd.NA
+        avg_past_occupancy = past["occupancy"].dropna().mean() if not past.empty else pd.NA
+
+        summer = group[group["month"].astype(str).str[5:7].isin(["06", "07", "08"])]
+        summer_occupancy = summer["occupancy"].dropna().mean() if not summer.empty else pd.NA
+
+        profile_row = profiles[profiles["listing"] == listing]
+        rental_model = (
+            profile_row["rental_model"].iloc[0]
+            if not profile_row.empty
+            else "unknown"
+        )
+
+        listing_signals = []
+
+        if pd.notna(avg_future_occupancy) and avg_future_occupancy < 0.25:
+            listing_signals.append("low_future_bookings")
+
+        if pd.notna(summer_occupancy) and summer_occupancy < 0.40:
+            listing_signals.append("weak_peak_season_bookings")
+
+        if rental_model == "medium_or_long_term":
+            listing_signals.append("medium_or_long_term_pattern")
+
+        if pd.notna(avg_past_occupancy) and pd.notna(avg_future_occupancy):
+            if avg_future_occupancy < avg_past_occupancy * 0.6:
+                listing_signals.append("future_bookings_weaker_than_past")
+
+        signals.append({
+            "listing": listing,
+            "rental_model": rental_model,
+            "average_past_occupancy": _safe_number(avg_past_occupancy),
+            "average_future_occupancy": _safe_number(avg_future_occupancy),
+            "summer_occupancy_on_books": _safe_number(summer_occupancy),
+            "signals": listing_signals,
+        })
+
+    return signals
+
+
+
+
+
 def build_ai_analysis_payload(
     daily_for_report: pd.DataFrame,
     daily_expenses_for_report: pd.DataFrame,
     listings: pd.DataFrame,
     report_group_label: str,
+    reservations_for_report: pd.DataFrame | None = None,
+    monthly_targets: pd.DataFrame | None = None,
     today: datetime | None = None,
 ) -> dict:
     """
@@ -2245,6 +2513,7 @@ def build_ai_analysis_payload(
     listings["listing"] = listings["listing"].apply(normalise_listing_key)
 
     listing_rows = []
+
     for _, listing_row in listings.sort_values("listing_name").iterrows():
         listing = normalise_listing_key(listing_row["listing"])
         listing_name = listing_row["listing_name"]
@@ -2253,6 +2522,7 @@ def build_ai_analysis_payload(
             daily_ytd[daily_ytd["listing"].apply(normalise_listing_key) == listing],
             expenses_ytd[expenses_ytd["listing"].apply(normalise_listing_key) == listing],
         )
+
         listing_otb = _calculate_period_metrics(
             daily_otb[daily_otb["listing"].apply(normalise_listing_key) == listing],
             expenses_otb[expenses_otb["listing"].apply(normalise_listing_key) == listing],
@@ -2263,6 +2533,40 @@ def build_ai_analysis_payload(
             "YTD": clean_metrics(listing_ytd),
             "OTB": clean_metrics(listing_otb),
         })
+
+    monthly_listing_performance = build_monthly_listing_performance(
+        daily_for_report,
+        daily_expenses_for_report,
+        listings,
+        today=today,
+    )
+
+    monthly_vs_target = (
+        build_monthly_vs_target_payload(
+            monthly_listing_performance,
+            monthly_targets,
+            listings,
+        )
+        if monthly_targets is not None
+        else []
+    )
+
+    booking_profiles = (
+        build_listing_booking_profile(reservations_for_report, listings)
+        if reservations_for_report is not None
+        else []
+    )
+
+    listing_signals = build_listing_signals(
+        monthly_listing_performance,
+        booking_profiles,
+    )
+
+    target_payload = (
+    build_monthly_target_payload(monthly_targets, listings)
+    if monthly_targets is not None
+    else []
+)
 
     return {
         "report_group": report_group_label,
@@ -2275,18 +2579,33 @@ def build_ai_analysis_payload(
             "Fixed_Cost_Per_Night": "fixed expenses divided by occupied nights",
             "Cleaning_Pct_Net": "cleaning fees divided by gross revenue minus concierge fees",
             "Net_Per_Night": "net after variable and fixed costs divided by occupied nights",
+            "monthly_targets": target_payload,
+            "monthly_vs_target": monthly_vs_target,
         },
         "headline_metrics": {
             "YTD": clean_metrics(ytd),
             "OTB": clean_metrics(otb),
             "Full_Year": {
-                "Gross_Revenue": _safe_number(ytd["Gross_Revenue"] + otb["Gross_Revenue"]),
-                "Net_After_Fixed_Costs": _safe_number(ytd["Net_After_Fixed_Costs"] + otb["Net_After_Fixed_Costs"]),
-                "Cleaning_Fees": _safe_number(ytd["Cleaning_Fees"] + otb["Cleaning_Fees"]),
+                "Gross_Revenue": _safe_number(
+                    ytd["Gross_Revenue"] + otb["Gross_Revenue"]
+                ),
+                "Net_After_Fixed_Costs": _safe_number(
+                    ytd["Net_After_Fixed_Costs"] + otb["Net_After_Fixed_Costs"]
+                ),
+                "Cleaning_Fees": _safe_number(
+                    ytd["Cleaning_Fees"] + otb["Cleaning_Fees"]
+                ),
             },
         },
         "listing_metrics": listing_rows,
-        "analysis_instruction": "Prioritise actionable insights. Identify the largest causes of losses and the listings that need attention.",
+        "monthly_listing_performance": monthly_listing_performance,
+        "booking_profiles": booking_profiles,
+        "listing_signals": listing_signals,
+        "analysis_instruction": (
+            "Prioritise actionable insights. Use monthly performance and listing signals "
+            "to distinguish seasonality, future booking weakness, medium/long-stay patterns, "
+            "and genuine listing underperformance."
+        ),
     }
 
 
@@ -2345,11 +2664,41 @@ def _plain_ai_fallback_to_html(text: str) -> str:
     <div style="background:white; padding:16px; margin-top:16px; border-radius:8px; border:1px solid #e5e7eb;">
       <h3 style="margin-top:0;">AI Insights & Actions</h3>
       <p style="font-size:12px; color:#666; margin-top:0;">
-      Generated from Python-calculated KPI tables and listing-level metrics. Calculations are still performed by Python.
+      Generated from KPI tables and listing-level metrics. Calculations are still performed by Python.
       </p>
       {body}
     </div>
     """
+
+def build_monthly_target_payload(
+    monthly_targets: pd.DataFrame,
+    listings: pd.DataFrame,
+) -> list[dict]:
+    targets = monthly_targets.copy()
+    listings = listings.copy()
+
+    targets["listing"] = targets["listing"].apply(normalise_listing_key)
+    listings["listing"] = listings["listing"].apply(normalise_listing_key)
+
+    targets = targets.merge(
+        listings[["listing", "listing_name"]],
+        on="listing",
+        how="left",
+    )
+
+    targets["listing_name"] = targets["listing_name"].fillna(targets["listing"])
+
+    records = []
+
+    for _, row in targets.iterrows():
+        records.append({
+            "listing": row["listing_name"],
+            "year_month": f"{int(row['year'])}-{int(row['month']):02d}",
+            "target": _safe_number(row["target"]),
+        })
+
+    return records
+
 
 
 def generate_ai_insights_html(
@@ -2357,6 +2706,8 @@ def generate_ai_insights_html(
     daily_expenses_for_report: pd.DataFrame,
     listings: pd.DataFrame,
     report_group_label: str,
+    reservations_for_report: pd.DataFrame | None = None,
+    monthly_targets: pd.DataFrame | None = None,
     enabled: bool = False,
 ) -> str:
 
@@ -2388,7 +2739,11 @@ def generate_ai_insights_html(
         daily_expenses_for_report,
         listings,
         report_group_label,
+        reservations_for_report=reservations_for_report,
+        monthly_targets=monthly_targets,
     )
+
+    #targets_json = monthly_targets.to_dict(orient="records")
 
     prompt = f"""
 Tu es un analyste pragmatique spécialisé dans la rentabilité de locations courte durée.
@@ -2412,11 +2767,14 @@ Règles d’interprétation IMPORTANTES :
 
 - Ne PAS utiliser le taux d’occupation sur l’année complète comme indicateur principal.
 - Se concentrer sur :
-  - le réalisé depuis le début de l’année
+  - le réalisé depuis le début de l’année (vs objectifs)
   - les réservations confirmées à venir
 
 - Ne PAS utiliser de noms de variables, ni d’anglais technique (ADR, YTD, OTB, etc).
 - Utiliser uniquement un langage naturel en français.
+
+- comprenez qu'un taux d'occupation de 100% pendant plus de deux mois signifie un autre type de location (de moyenne ou de longue durée). Une reflexion est possible sur la rentabilité de ce type d'activité vs la location courte durée en prenant en compte les frais reduit associés et le taux d'occupation garantie, mais verus des revenues inferieures.
+- comprenez qu'un taux d'occupation à 0% pendant plus de 4 mois signifie un bien qui n'est pas commercialisé mais qui contribue quand meme aux frais fixes.
 
 - Distinguer clairement les causes :
   1. manque d’occupation
@@ -2459,6 +2817,68 @@ Retourner UNIQUEMENT du JSON valide :
 
 Données :
 {json.dumps(payload, ensure_ascii=False, indent=2)}
+
+
+"""
+    
+    prompt=f"""
+    Analyse PRIORITAIRE :
+
+    1. Identifier les logements réellement sous-performants.
+    2. Distinguer un problème structurel d’un simple effet saisonnier.
+    3. Comparer le réalisé aux objectifs mensuels (targets) - focus sur le passé et le futur proche (voir ci-dessous)
+    4. Noter que les reservations se font au fur et à mesure, il est normal que le calendrier soit vide 2 mois avant (sauf pour la periode estivale)
+    4. Identifier les leviers commerciaux réalistes :
+    - occupation
+    - prix
+    - durée de séjour
+    - réduction des coûts variables
+    5. Ne mentionner les coûts fixes qu’en dernier niveau d’analyse, qui sont en generale non-compressible (eg remboursement de credit immobilier)
+
+    Tu dois commenter les écarts aux objectifs si les données "monthly_vs_target" sont présentes.
+Identifier les mois/logements les plus en retard par rapport aux objectifs.
+Ne pas simplement mentionner les objectifs : expliquer où l’écart est le plus important et ce que cela implique.
+
+    Adopter une logique d’exploitant :
+    - éviter les conclusions alarmistes
+    - éviter les répétitions
+    - privilégier les recommandations concrètes et réalistes
+
+    Contexte touristique 2026 (France / Bretagne) :
+
+- Le tourisme domestique français reste globalement résilient en 2026.
+- Les destinations côtières françaises devraient rester relativement demandées pendant l’été.
+- La Bretagne reste un marché très saisonnier, avec une forte concentration de la demande entre juin et août.
+- Les réservations hors saison restent naturellement plus faibles.
+- Les voyageurs semblent réserver plus tardivement qu’avant, dans un contexte économique plus incertain.
+- Les séjours plus longs et les locations de moyenne durée deviennent plus fréquents.
+- Un faible niveau de réservation en été est plus préoccupant qu’un faible niveau de réservation en hiver.
+- Ne pas considérer automatiquement un faible remplissage futur comme structurel si la période est encore éloignée.
+
+    Retourner UNIQUEMENT du JSON valide :
+
+    {{
+    "critical_issues": [],
+    "target_gaps": [],
+    "key_drivers": [],
+    "recommended_actions": [],
+    "data_gaps": []
+    }}
+
+    IMPORTANT :
+    - Toutes les sections doivent contenir uniquement des phrases simples.
+    - Ne pas retourner d’objets JSON imbriqués.
+    - Pas d’analyse mois par mois.
+    - Faire une synthèse de haut niveau.
+    - Mentionner les objectifs uniquement lorsqu’un écart est significatif ou révélateur.
+    - Éviter les répétitions.
+    - repondre en francais et ne pas utiliser des acronymes.
+
+    Données :
+    
+    {json.dumps(payload, ensure_ascii=False, indent=2)}
+
+
 """
 
     try:
@@ -2494,9 +2914,80 @@ Données :
         </div>
         """
     
+
+def build_monthly_vs_target_payload(
+    monthly_listing_performance: list[dict],
+    monthly_targets: pd.DataFrame,
+    listings: pd.DataFrame,
+) -> list[dict]:
+    perf = pd.DataFrame(monthly_listing_performance)
+    targets = monthly_targets.copy()
+    listings = listings.copy()
+
+    if perf.empty or targets.empty:
+        return []
+
+    targets["listing_key"] = targets["listing"].apply(normalise_listing_key)
+    listings["listing_key"] = listings["listing"].apply(normalise_listing_key)
+
+    targets = targets.merge(
+        listings[["listing_key", "listing_name"]],
+        on="listing_key",
+        how="left",
+    )
+
+    targets["listing"] = targets["listing_name"].fillna(targets["listing_key"])
+
+    targets["month"] = (
+        targets["year"].astype(int).astype(str)
+        + "-"
+        + targets["month"].astype(int).astype(str).str.zfill(2)
+    )
+
+    targets["monthly_target"] = pd.to_numeric(
+        targets["target"],
+        errors="coerce",
+    )
+
+    comparison = perf.merge(
+        targets[["listing", "month", "monthly_target"]],
+        on=["listing", "month"],
+        how="left",
+    )
+
+    comparison["gap_to_target"] = (
+        comparison["gross_revenue"] - comparison["monthly_target"]
+    )
+
+    comparison["pct_of_target"] = (
+        comparison["gross_revenue"]
+        / comparison["monthly_target"].replace(0, pd.NA)
+    )
+
+    records = []
+
+    for _, row in comparison.iterrows():
+        if pd.isna(row.get("monthly_target")):
+            continue
+
+        records.append({
+            "listing": row["listing"],
+            "month": row["month"],
+            "period_type": row["period_type"],
+            "gross_revenue": _safe_number(row["gross_revenue"]),
+            "monthly_target": _safe_number(row["monthly_target"]),
+            "gap_to_target": _safe_number(row["gap_to_target"]),
+            "pct_of_target": _safe_number(row["pct_of_target"]),
+            "occupancy": _safe_number(row["occupancy"]),
+            "booked_nights": int(row["booked_nights"]),
+        })
+
+    return records
+    
 def render_structured_ai_insights(sections: dict) -> str:
     section_config = [
         ("critical_issues", "🔴 Points critiques", "#dc2626"),
+        ("target_gaps", "🎯 Écarts aux objectifs", "#2563eb"),
         ("key_drivers", "🟡 Facteurs explicatifs", "#f59e0b"),
         ("recommended_actions", "🟢 Actions recommandées", "#16a34a"),
         ("data_gaps", "⚪ Données manquantes", "#6b7280"),
@@ -2513,10 +3004,15 @@ def render_structured_ai_insights(sections: dict) -> str:
         html_parts.append(
             f'<h4 style="margin:14px 0 6px 0; color:{color};">{title}</h4>'
         )
-        html_parts.append('<ul style="margin-top:0; padding-left:20px;">')
+
+        html_parts.append(
+            '<ul style="margin-top:4px; padding-left:20px; line-height:1.4;">'
+        )
 
         for item in items:
-            html_parts.append(f"<li>{_html_escape(item)}</li>")
+            html_parts.append(
+                f"<li>{_html_escape(str(item))}</li>"
+            )
 
         html_parts.append("</ul>")
 
@@ -2528,42 +3024,6 @@ def render_structured_ai_insights(sections: dict) -> str:
         """
 
     return "\n".join(html_parts)
-
-def render_ai_insights_json(ai_text: str) -> str:
-    import json
-    import re
-
-    # Remove markdown fences if the model returns ```json ... ```
-    cleaned = re.sub(r"^```json\s*|\s*```$", "", ai_text.strip(), flags=re.MULTILINE)
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        return f"<pre style='white-space:pre-wrap;'>{ai_text}</pre>"
-
-    sections = [
-        ("🔴 Critical Issues", "critical_issues", "#dc2626"),
-        ("🟡 Key Drivers", "key_drivers", "#f59e0b"),
-        ("🟢 Recommended Actions", "recommended_actions", "#16a34a"),
-        ("⚪ Data Gaps", "data_gaps", "#6b7280"),
-    ]
-
-    html = ""
-
-    for title, key, color in sections:
-        items = data.get(key, [])
-        if not items:
-            continue
-
-        html += f"<h4 style='margin-bottom:6px; color:{color};'>{title}</h4>"
-        html += "<ul style='margin-top:0;'>"
-
-        for item in items:
-            html += f"<li>{item}</li>"
-
-        html += "</ul>"
-
-    return html
 
 def build_finance_email_html(
     gross_revenue_pivot: pd.DataFrame,
@@ -3266,6 +3726,8 @@ def main() -> None:
             daily_expenses_for_report,
             finance_listings,
             report_group_label=group_label(selected_groups),
+            reservations_for_report=reservations_for_report,
+            monthly_targets=expanded_targets,
             enabled=args.ai_insights,
         )
 
